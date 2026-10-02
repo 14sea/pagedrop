@@ -1,17 +1,30 @@
+P_PWD ?= $(shell pwd)
+P_KVER ?= $(shell uname -r)
+
 ccflags-y := \
-  -std=gnu99 \
-  -Werror \
-  -Wno-declaration-after-statement \
-  $(CCFLAGS)
+	-std=gnu99 \
+	-Werror \
+	-Wno-declaration-after-statement \
+	$(CCFLAGS)
 
-obj-m+=pagebuster.o
+obj-m += pagedrop.o
 
-KBUILD_DIR=/lib/modules/$(shell uname -r)/build
+ifneq ($(KERNELRELEASE),)
+ifeq ($(ARCH),arm64)
+ccflags-y += -DPB_ARCH_ARM64
+else ifeq ($(ARCH),x86)
+ccflags-y += -DPB_ARCH_X86_64
+else ifeq ($(ARCH),x86_64)
+ccflags-y += -DPB_ARCH_X86_64
+endif
+else
+KERNEL ?= /lib/modules/$(P_KVER)/build
 
-# Kernel module build dependency
 all:
-	make -C $(KBUILD_DIR) M=$(PWD) modules
-#
-# Kernel module clean dependency
+	$(MAKE) -C $(KERNEL) M=$(P_PWD) modules
+
 clean:
-	make -C $(KBUILD_DIR) M=$(PWD) clean
+	$(MAKE) -C $(KERNEL) M=$(P_PWD) clean
+
+.PHONY: all clean
+endif

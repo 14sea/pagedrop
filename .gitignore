@@ -1,0 +1,13 @@
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+Module.symvers
+modules.order
+userland/c/capture
+userland/c/sigsegv.out
+userland/c/simple
+userland/c/upxtest
+userland/c/upxtest.orig
+userland/c/extra

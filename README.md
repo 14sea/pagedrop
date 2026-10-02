@@ -1,8 +1,8 @@
-# PageBuster
+# pagedrop
 
 >_Ever wanted to dump all the executable pages of a process? Do you crave something capable of dealing with **packed** processes?_
 
-We've got you covered! May I introduce **PageBuster**, our tool to gather dumps of all executable pages of packed processes.
+We've got you covered! **pagedrop** dumps every executable page of a packed process. It is the maintained kernel module that followed the unmaintained PageBuster tree.
 
 [![asciicast](https://asciinema.org/a/cJH2O5N8w8Dd0GUuHw9kj8CZM.svg)](https://asciinema.org/a/cJH2O5N8w8Dd0GUuHw9kj8CZM)
 
@@ -13,20 +13,41 @@ There are plenty of scenarios in which the ability to dump executable pages is h
 
 For example, think about the case of packed malware samples. Run-time packers are often used by malware-writers to obfuscate their code and hinder static analysis. Packers can be of growing complexity, and, in many cases, a precise moment in time when the entire original code is completely unpacked in memory doesn't even exist.
 
-Therefore, the goals of **PageBuster** are:
+Therefore, the goals of **pagedrop** are:
 
 1. To dump all the executable pages, without assuming there is a moment in time where the program is fully unpacked;
 2. To do this in a stealthy way (no VM, no ptrace).
 
 In particular, given the widespread use of packers and their variety, our objective is to have a single all-encompassing solution, as opposed to packer-specific ones.
 
-Ultimately, PageBuster fits in the context of the rev.ng decompiler. Specifically, it is related to what we call [MetaAddress](https://github.com/revng/revng/blob/9869f05/include/revng/Support/MetaAddress.h#L382). Among other things, a MetaAddress enables you to represent an absolute value of an address together with a timestamp (_epoch_), so that it can be used to track how a memory location changes during the execution of a program. Frequently, you can have different code at different moments at the same address during program execution. PageBuster was designed around this simple yet effective data structure.
+Ultimately, pagedrop fits in the context of the rev.ng decompiler. Specifically, it is related to what we call [MetaAddress](https://github.com/revng/revng/blob/9869f05/include/revng/Support/MetaAddress.h#L382). Among other things, a MetaAddress enables you to represent an absolute value of an address together with a timestamp (_epoch_), so that it can be used to track how a memory location changes during the execution of a program. Frequently, you can have different code at different moments at the same address during program execution. The original PageBuster module was designed around this simple yet effective data structure.
 
 For more information, please refer to our [blogpost](https://rev.ng/blog/pagebuster/post.html).
 
-There are two PageBuster implementations: a prototype user-space-only and the full-fledged one, employing with a kernel module.
+There are two implementations: a prototype user-space-only and the full-fledged one, employing a kernel module.
 The former is described in `userpagebuster/`.
 The rest of this document describes the latter.
+
+From PageBuster to pagedrop
+---------------------------
+
+PageBuster was written by Matteo Giordano in 2021 for the [rev.ng](https://rev.ng) decompiler. Packers rarely leave one moment when the whole program is unpacked, so the module dumped each executable page as it became executable and stamped it with an epoch. That epoch is what a [MetaAddress](https://github.com/revng/revng/blob/9869f05/include/revng/Support/MetaAddress.h#L382) uses to tell two generations of code at the same address apart. The write-up is the [rev.ng blog post](https://rev.ng/blog/pagebuster/post.html).
+
+The first cut was `userpagebuster/`, an `LD_PRELOAD` prototype. It only saw library calls the target made itself, not the kernel and not the ELF loader. The real tool was the kernel module: ftrace hooks on x86_64, for kernels older than about 5.9.2. That tree was left unmaintained. It does not build or load on current kernels.
+
+pagedrop is the maintained module, under a new name so it is not mistaken for the frozen 2021 tree. The job is the same. The machinery is not.
+
+What changed:
+
+- One source file, `pagedrop.c`. The Makefile selects the architecture from the target kernel, the same way LKRG does. `LINUX_VERSION_CODE` selects the APIs. Kernels older than 5.10 are no longer supported.
+- x86_64 still uses ftrace. It was brought up through Ubuntu 24.04, kernel 6.8.0-101-generic. On 5.11 and later the module does not set `FTRACE_OPS_FL_RECURSION`, and it moves the instruction pointer with `ftrace_regs_set_instruction_pointer`.
+- arm64, Linux >= 5.10, uses kprobes. Those kernels are built with `CONFIG_DYNAMIC_FTRACE_WITH_ARGS` and not `CONFIG_DYNAMIC_FTRACE_WITH_REGS`, so the x86 ftrace redirect does not register. The kprobe jumps to the same handlers, which then run in process context.
+- The ELF loader is caught by hooking `vm_mmap_pgoff`, not only the `mmap` syscall. Dumps go through `copy_from_user` and `kernel_write`. There is no `stac`/`clac`.
+- A list lock keeps a multithreaded unpacker from oopsing. Tracking follows the tgid, so a `prctl` rename and a child stay watched. `fork`, `vfork`, `clone`, `clone3`, and `do_exit` maintain that list.
+- A successful `execve` or `execveat` of a matching path starts tracking. A failed exec does not drop the list.
+- `pkey_mprotect` and `mremap` are hooked, so a protection-key toggle and a moved mapping are dumped at the address the code actually runs from.
+- Anonymous W^X mappings are the only ones forced with `MAP_POPULATE`. On arm64 the fault class comes from the ESR, and a tagged fault address is untagged before the page is looked up. `PROT_BTI` and `PROT_MTE` are tested as bits, not as an exact `prot` value. MTE itself is not exercised: the Raspberry Pi 4 has none.
+- The same address can be unpacked twice. Both dumps are kept, under different epochs. Dropping exec and making the page executable again dumps the new bytes, and leaves the old file in place.
 
 Build
 -----
@@ -40,24 +61,60 @@ sudo apt install build-essential linux-headers-$(uname -r)
 Then, build the kernel module:
 
 ```sh
-cd pagebuster
+cd pagedrop
 make
 ```
 
-This will produce `pagebuster.ko`, the module for the kernel you are currently running.
-Please make sure the kernel version is lower than v5.9.2 since **PageBuster** has not been tested for newer versions.
+To build against another installed kernel, or a kernel tree, the same way LKRG does:
+
+```sh
+make P_KVER=6.8.0-101-generic
+make KERNEL=/path/to/linux
+```
+
+The Makefile passes `-DPB_ARCH_X86_64` or `-DPB_ARCH_ARM64` from the target kernel's `ARCH`. `pagedrop.c` is the only module source. `LINUX_VERSION_CODE` selects version-specific APIs. x86_64 uses ftrace. arm64 (Linux >= 5.10) uses kprobes, because those kernels are built with `CONFIG_DYNAMIC_FTRACE_WITH_ARGS` and not `CONFIG_DYNAMIC_FTRACE_WITH_REGS`.
+
+This will produce `pagedrop.ko` for that kernel.
+Kernels older than 5.10 are no longer the supported line. `userpagebuster/` is the old user-space prototype and is not part of that port.
+
+Tests
+-----
+
+```sh
+tools/x86/run_tests.sh
+tools/arm64/run_tests.sh
+```
+
+Both passed. x86_64 was Ubuntu 24.04, kernel 6.8.0-101-generic, ftrace, UPX 4.2.2. arm64 was Raspberry Pi 4, Debian 12, kernel 6.6.62+rpt-rpi-v8, kprobes, UPX 5.0.2. UPX 4.2.2's static arm64 stub hits `SIGILL` on that board with the module unloaded. Pi 4 has no protection keys and no MTE. `pkey_mprotect` is still hooked. A tagged fault address is checked on arm64 only.
+
+| Use case | x86_64 | arm64 |
+|---|---|---|
+| 12 hooks install, clean `rmmod` | pass | pass |
+| ELF `.text` live-matches the dump | pass | pass |
+| RWX write fault, then exec fault dumps the page | pass | pass |
+| `prctl` rename still tracked | pass | pass |
+| Child after `fork` still tracked | pass | pass |
+| `mremap` dump is at the new address | pass | pass |
+| `pkey_mprotect` dumps on exec | pass | pass, via the syscall |
+| 4 threads call `mprotect`, no oops | pass | pass |
+| UPX static binary, marker live-matches | pass | pass |
+| Same address, two epochs, both dumps kept | pass | pass |
+| Failed `execve` does not drop tracking | pass | pass |
+| `execve` / `execveat` of a matching path starts tracking | pass | pass |
+| Exec, drop exec, exec again; second dump is the new bytes | pass | pass |
+| Tagged fault address dumps the untagged page | n/a | pass |
 
 **Note**: Please consider using a **virtual machine** (VirtualBox, VMWare, QEMU, etc.) for testing. The module could be harmful. Avoid killing your machine or production environment by accident.
 
 Usage
 -----
 
-To test **PageBuster**, you can insert the LKM and try it with whatever binary you want. We provided you with [`sigsegv.c`](https://github.com/zTehRyaN/pagebuster/blob/main/sigsegv.c), a `.c` program that simply maps and executes a shellcode. Inside the `/userland/c/` directory you will also find `simple.c`, the one shown in the demo.
+To test **pagedrop**, you can insert the LKM and try it with whatever binary you want. We provided you with [`sigsegv.c`](https://github.com/zTehRyaN/pagebuster/blob/main/sigsegv.c), a `.c` program that simply maps and executes a shellcode. Inside the `/userland/c/` directory you will also find `simple.c`, the one shown in the demo.
 
 So, just `insmod` the module and pass the name of the process as argument. Then, execute it.
 
 ```sh
-insmod pagebuster.ko path=sigsegv.out
+insmod pagedrop.ko path=sigsegv.out
 ./sigsegv.out
 ```
 
@@ -81,10 +138,27 @@ You should get an output similar to the following:
 ...
 ```
 
+Userland programs live in `userland/c/`:
+
+| Program | What it checks |
+|---|---|
+| `simple` | Loader-mapped `.text` |
+| `sigsegv.out` | Write-or-execute page, then the execute fault |
+| `capture` | Rename, child, `mremap`, `pkey_mprotect`, threads |
+| `upxtest` | Static binary for UPX. Pack it with `upx -o upxtest upxtest` after `make upxtest` |
+
+`capture` exits 0 only if its markers were dumped. The full check, including a live physical-page compare, is `tools/x86/run_tests.sh`. It needs `upx` and a static libc, and it loads the module.
+
+```sh
+cd userland/c && make
+sudo insmod ../../pagedrop.ko path=capture
+./capture
+```
+
 To remove the LKM, run:
 
 ```sh
-rmmod pagebuster.ko
+rmmod pagedrop.ko
 ```
 
 Quickly test in QEMU
@@ -143,7 +217,7 @@ You can now run QEMU:
 
 Use with `Ctrl-A X` to quit QEMU or type `poweroff`.
 
-If you use `linux-kernel-module-cheat` to build the module and the programs for you, you can put `pagebuster.c` inside `/kernel_modules`, and the `c` files inside `/userland/c`. Then run:
+If you use `linux-kernel-module-cheat` to build the module and the programs for you, you can put `pagedrop.c` inside `/kernel_modules`, and the `c` files inside `/userland/c`. Then run:
 
 ```sh
 # Rebuild and run
@@ -153,7 +227,7 @@ If you use `linux-kernel-module-cheat` to build the module and the programs for 
 
 # Load kernel module
 cd /mnt/9p/out_rootfs_overlay/lkmc
-insmod pagebuster.ko path=sigsegv.out
+insmod pagedrop.ko path=sigsegv.out
 
 # Run the program
 ./c/sigsegv.out
@@ -167,7 +241,7 @@ If you want to test with other binaries, you may put the source `.c` file inside
 UPX testing
 -----------
 
-If you want to try how **PageBuster** behaves with UPX-packed binaries, you should prepare them outside the QEMU guest environment, and then inject into it.
+If you want to try how **pagedrop** behaves with UPX-packed binaries, you should prepare them outside the QEMU guest environment, and then inject into it.
 First of all, install [upx](https://upx.github.io/). On Ubuntu 20.04 LTS, run:
 
 ```sh
@@ -195,7 +269,7 @@ Now you can test it, in the usual way:
 
 ```sh
 ./run
-insmod /mnt/9p/out_rootfs_overlay/lkmc/pagebuster.ko path=mytest_packed
+insmod /mnt/9p/out_rootfs_overlay/lkmc/pagedrop.ko path=mytest_packed
 ./mytest_packed
 ls /tmp
 ```
