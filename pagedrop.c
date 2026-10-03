@@ -82,6 +82,14 @@ static char *path;
 module_param(path, charp, 0000);
 MODULE_PARM_DESC(path, "Path/Name of the target process");
 
+static int exact;
+module_param(exact, int, 0000);
+MODULE_PARM_DESC(exact, "Match path= exactly (default is a substring)");
+
+static char *data;
+module_param(data, charp, 0000);
+MODULE_PARM_DESC(data, "Armed data range start-end, hex, for the read trace");
+
 static LIST_HEAD(marea_list);
 static DEFINE_MUTEX(marea_lock);
 static unsigned long epoch_counter;
@@ -89,6 +97,7 @@ static unsigned long epoch_counter;
 struct pb_tgid {
 	struct list_head list;
 	pid_t tgid;
+	int armed;
 };
 
 static LIST_HEAD(tgid_list);
@@ -98,7 +107,14 @@ struct marea {
 	struct list_head list;
 	unsigned long addr;
 	unsigned long prot;
+	pid_t tgid;
+	unsigned long epoch;
 };
+
+static unsigned long data_lo, data_hi;
+static int data_on;
+static LIST_HEAD(data_seen);
+static DEFINE_MUTEX(pb_log_lock);
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
 #define pb_access_ok(addr, size) access_ok(VERIFY_READ, (addr), (size))
@@ -176,6 +192,7 @@ static void pb_tgid_add(pid_t tgid)
 	if (!n)
 		return;
 	n->tgid = tgid;
+	n->armed = 0;
 	INIT_LIST_HEAD(&n->list);
 	spin_lock(&tgid_lock);
 	list_for_each_entry(t, &tgid_list, list) {
@@ -211,6 +228,36 @@ static void pb_tgid_clear(void)
 	list_for_each_entry_safe(t, tmp, &tgid_list, list) {
 		list_del(&t->list);
 		kfree(t);
+	}
+	spin_unlock(&tgid_lock);
+}
+
+static int pb_tgid_armed(pid_t tgid)
+{
+	struct pb_tgid *t;
+	int armed = 0;
+
+	spin_lock(&tgid_lock);
+	list_for_each_entry(t, &tgid_list, list) {
+		if (t->tgid == tgid) {
+			armed = t->armed;
+			break;
+		}
+	}
+	spin_unlock(&tgid_lock);
+	return armed;
+}
+
+static void pb_tgid_set_armed(pid_t tgid)
+{
+	struct pb_tgid *t;
+
+	spin_lock(&tgid_lock);
+	list_for_each_entry(t, &tgid_list, list) {
+		if (t->tgid == tgid) {
+			t->armed = 1;
+			break;
+		}
 	}
 	spin_unlock(&tgid_lock);
 }
@@ -312,7 +359,7 @@ static int pb_page_count(unsigned long len)
 	return (len + PAGE_SIZE - 1) / PAGE_SIZE;
 }
 
-static struct marea *search_page(unsigned long addr_given)
+static struct marea *search_page(pid_t tgid, unsigned long addr_given)
 {
 	struct marea *result;
 
@@ -320,13 +367,15 @@ static struct marea *search_page(unsigned long addr_given)
 		unsigned long start_addr = result->addr;
 		unsigned long end_addr = start_addr + PAGE_SIZE - 1;
 
+		if (result->tgid != tgid)
+			continue;
 		if (addr_given >= start_addr && addr_given <= end_addr)
 			return result;
 	}
 	return NULL;
 }
 
-static struct marea *new_marea(unsigned long addr, unsigned long prot)
+static struct marea *new_marea(pid_t tgid, unsigned long addr, unsigned long prot)
 {
 	struct marea *new_m;
 
@@ -335,12 +384,15 @@ static struct marea *new_marea(unsigned long addr, unsigned long prot)
 		return NULL;
 	new_m->addr = addr;
 	new_m->prot = prot;
+	new_m->tgid = tgid;
+	new_m->epoch = 0;
 	INIT_LIST_HEAD(&new_m->list);
 	return new_m;
 }
 
 static void track_pages(unsigned long addr, int n_pages, unsigned long prot)
 {
+	pid_t tgid = current->tgid;
 	int i;
 
 	mutex_lock(&marea_lock);
@@ -351,11 +403,12 @@ static void track_pages(unsigned long addr, int n_pages, unsigned long prot)
 		int replaced = 0;
 
 		list_for_each_entry(entry, &marea_list, list) {
-			if (entry->addr != page)
+			if (entry->tgid != tgid || entry->addr != page)
 				continue;
-			fresh = new_marea(page, prot);
+			fresh = new_marea(tgid, page, prot);
 			if (!fresh)
 				goto out;
+			fresh->epoch = entry->epoch;
 			list_replace(&entry->list, &fresh->list);
 			kfree(entry);
 			replaced = 1;
@@ -363,7 +416,7 @@ static void track_pages(unsigned long addr, int n_pages, unsigned long prot)
 		}
 		if (replaced)
 			continue;
-		fresh = new_marea(page, prot);
+		fresh = new_marea(tgid, page, prot);
 		if (!fresh)
 			break;
 		list_add(&fresh->list, &marea_list);
@@ -382,7 +435,7 @@ static void untrack_pages(unsigned long addr, int n_pages)
 		unsigned long page = addr + (i * PAGE_SIZE);
 
 		list_for_each_entry_safe(entry, tmp, &marea_list, list) {
-			if (entry->addr != page)
+			if (entry->tgid != current->tgid || entry->addr != page)
 				continue;
 			list_del(&entry->list);
 			kfree(entry);
@@ -414,7 +467,7 @@ static bool pb_take_page(unsigned long addr, unsigned long *page_addr, unsigned 
 	bool found = false;
 
 	mutex_lock(&marea_lock);
-	page = search_page(addr);
+	page = search_page(current->tgid, addr);
 	if (page) {
 		*page_addr = page->addr;
 		*prot = page->prot;
@@ -424,14 +477,41 @@ static bool pb_take_page(unsigned long addr, unsigned long *page_addr, unsigned 
 	return found;
 }
 
-static int dump_to_file(unsigned long user_addr, size_t size)
+static void pb_log_line(const char *path, const char *line)
+{
+	struct file *f;
+	loff_t pos = 0;
+
+	f = filp_open(path, O_CREAT | O_WRONLY | O_APPEND | O_LARGEFILE, 0644);
+	if (IS_ERR(f))
+		return;
+	kernel_write(f, line, strlen(line), &pos);
+	filp_close(f, NULL);
+}
+
+static void pb_note_epoch(pid_t tgid, unsigned long page, unsigned long epoch)
+{
+	struct marea *entry;
+
+	mutex_lock(&marea_lock);
+	entry = search_page(tgid, page);
+	if (entry)
+		entry->epoch = epoch;
+	mutex_unlock(&marea_lock);
+}
+
+static int dump_to_file(unsigned long user_addr, size_t size, const char *why,
+			 unsigned long *ep_out)
 {
 	struct file *dest;
 	char file_path[64];
+	char line[160];
 	void *kbuf;
 	loff_t pos = 0;
 	ssize_t written;
 	unsigned long left;
+	unsigned long ep;
+	pid_t tgid = current->tgid;
 
 	if (!size || !pb_access_ok((void __user *)user_addr, size))
 		return -EFAULT;
@@ -447,8 +527,11 @@ static int dump_to_file(unsigned long user_addr, size_t size)
 		return -EFAULT;
 	}
 
-	snprintf(file_path, sizeof(file_path), "/tmp/%lx_%lu", user_addr, epoch_counter);
-	epoch_counter++;
+	mutex_lock(&pb_log_lock);
+	ep = epoch_counter++;
+	mutex_unlock(&pb_log_lock);
+
+	snprintf(file_path, sizeof(file_path), "/tmp/%lx_%lu", user_addr, ep);
 
 	dest = filp_open(file_path, O_CREAT | O_WRONLY | O_TRUNC | O_LARGEFILE, 0644);
 	if (IS_ERR(dest)) {
@@ -462,15 +545,23 @@ static int dump_to_file(unsigned long user_addr, size_t size)
 		pr_warn("kernel_write %s: %zd\n", file_path, written);
 	filp_close(dest, NULL);
 	kvfree(kbuf);
-	return written < 0 ? written : 0;
+	if (written < 0 || (size_t)written != size)
+		return written < 0 ? written : -EIO;
+	pb_note_epoch(tgid, user_addr, ep);
+	snprintf(line, sizeof(line), "%d %s %lx %lu %s\n", tgid,
+		 current->comm[0] ? current->comm : "-", user_addr, ep, why);
+	pb_log_line("/tmp/pagedrop.index", line);
+	if (ep_out)
+		*ep_out = ep;
+	return 0;
 }
 
-static void dump_pages(unsigned long addr, int n_pages)
+static void dump_pages(unsigned long addr, int n_pages, const char *why)
 {
 	int i;
 
 	for (i = 0; i < n_pages; i++)
-		dump_to_file(addr + (i * PAGE_SIZE), PAGE_SIZE);
+		dump_to_file(addr + (i * PAGE_SIZE), PAGE_SIZE, why, NULL);
 }
 
 #if defined(PB_HOOK_FTRACE)
@@ -612,7 +703,8 @@ static void pb_handle_protect(struct pt_regs *regs)
 		track_pages(addr, n_pages, prot);
 		pb_set_arg(regs, 2, prot & ~PROT_WRITE);
 	} else if (prot_has_x_only(prot)) {
-		dump_pages(addr, n_pages);
+		track_pages(addr, n_pages, prot);
+		dump_pages(addr, n_pages, "mprotect");
 	} else {
 		untrack_pages(addr, n_pages);
 	}
@@ -620,11 +712,69 @@ static void pb_handle_protect(struct pt_regs *regs)
 
 static asmlinkage long (*real_sys_mprotect)(struct pt_regs *regs);
 
+static long pb_mprotect(unsigned long addr, unsigned long len, unsigned long prot)
+{
+	struct pt_regs regs;
+
+	if (!real_sys_mprotect)
+		return -EINVAL;
+	memset(&regs, 0, sizeof(regs));
+	pb_set_arg(&regs, 0, addr);
+	pb_set_arg(&regs, 1, len);
+	pb_set_arg(&regs, 2, prot);
+	return real_sys_mprotect(&regs);
+}
+
+static bool pb_can_arm(unsigned long addr)
+{
+	struct vm_area_struct *vma;
+	bool ok = false;
+
+	if (!current->mm)
+		return false;
+	if (mmap_read_lock_killable(current->mm))
+		return false;
+	vma = find_vma(current->mm, addr);
+	if (vma && vma->vm_start <= addr && !(vma->vm_flags & VM_EXEC))
+		ok = true;
+	mmap_read_unlock(current->mm);
+	return ok;
+}
+
+static int pb_arm_range(void)
+{
+	unsigned long addr;
+	int n = 0;
+
+	if (!data_on || data_hi <= data_lo)
+		return 0;
+	for (addr = data_lo; addr < data_hi; addr += PAGE_SIZE) {
+		if (!pb_can_arm(addr))
+			continue;
+		if (pb_mprotect(addr, PAGE_SIZE, PROT_NONE) == 0)
+			n++;
+	}
+	return n;
+}
+
+static void pb_try_arm(void)
+{
+	if (!data_on || pb_tgid_armed(current->tgid))
+		return;
+	if (pb_arm_range() > 0)
+		pb_tgid_set_armed(current->tgid);
+}
+
 static asmlinkage long fh_sys_mprotect(struct pt_regs *regs)
 {
+	unsigned long prot;
+
 	if (!pb_is_target())
 		return real_sys_mprotect(regs);
+	prot = pb_arg(regs, 2);
 	pb_handle_protect(regs);
+	if (prot_has_x_only(prot) || prot_has_wx(prot))
+		pb_try_arm();
 	return real_sys_mprotect(regs);
 }
 
@@ -632,9 +782,14 @@ static asmlinkage long (*real_sys_pkey_mprotect)(struct pt_regs *regs);
 
 static asmlinkage long fh_sys_pkey_mprotect(struct pt_regs *regs)
 {
+	unsigned long prot;
+
 	if (!pb_is_target())
 		return real_sys_pkey_mprotect(regs);
+	prot = pb_arg(regs, 2);
 	pb_handle_protect(regs);
+	if (prot_has_x_only(prot) || prot_has_wx(prot))
+		pb_try_arm();
 	return real_sys_pkey_mprotect(regs);
 }
 
@@ -668,7 +823,7 @@ static void pb_note_mremap(unsigned long old, unsigned long old_len,
 		unsigned long from = old + i * PAGE_SIZE;
 
 		mutex_lock(&marea_lock);
-		entry = search_page(from);
+		entry = search_page(current->tgid, from);
 		if (entry) {
 			if (i < new_pages)
 				entry->addr = new + i * PAGE_SIZE;
@@ -679,7 +834,7 @@ static void pb_note_mremap(unsigned long old, unsigned long old_len,
 		}
 		mutex_unlock(&marea_lock);
 		if (i < new_pages && pb_page_exec(new + i * PAGE_SIZE))
-			dump_to_file(new + i * PAGE_SIZE, PAGE_SIZE);
+			dump_to_file(new + i * PAGE_SIZE, PAGE_SIZE, "mremap", NULL);
 	}
 }
 
@@ -733,10 +888,19 @@ static asmlinkage unsigned long fh_vm_mmap_pgoff(struct file *file,
 	if (IS_ERR_VALUE(ret))
 		return ret;
 
-	if (prot_has_x_only(prot))
-		dump_pages(ret, n_pages);
-	else
+	if (prot_has_x_only(prot)) {
+		int i;
+
+		track_pages(ret, n_pages, prot);
+		for (i = 0; i < n_pages; i++) {
+			unsigned long page = ret + i * PAGE_SIZE;
+
+			if (dump_to_file(page, PAGE_SIZE, "mmap", NULL) < 0)
+				continue;
+		}
+	} else {
 		untrack_pages(ret, n_pages);
+	}
 
 	return ret;
 }
@@ -754,6 +918,116 @@ static bool pb_fault_is_write(void)
 #else
 	return current->thread.error_code & X86_PF_WRITE;
 #endif
+}
+
+static bool pb_fault_is_read(void)
+{
+#if defined(PB_ARM64)
+	unsigned long esr = current->thread.fault_code;
+
+	if ((esr & ESR_ELx_FSC) == ESR_ELx_FSC_MTE)
+		return false;
+	return ESR_ELx_EC(esr) == ESR_ELx_EC_DABT_LOW && !(esr & ESR_ELx_WNR);
+#else
+	unsigned long ec = current->thread.error_code;
+
+	return !(ec & X86_PF_WRITE) && !(ec & X86_PF_INSTR);
+#endif
+}
+
+static unsigned long pb_fault_ip(void)
+{
+	unsigned long ip = instruction_pointer(task_pt_regs(current));
+
+#if defined(PB_ARM64)
+	ip = untagged_addr(ip);
+#endif
+	return ip;
+}
+
+static bool pb_ip_tracked(unsigned long ip, unsigned long *epoch)
+{
+	struct marea *page;
+	bool found = false;
+
+	mutex_lock(&marea_lock);
+	page = search_page(current->tgid, ip);
+	if (page && (page->prot & PROT_EXEC)) {
+		*epoch = page->epoch;
+		found = true;
+	}
+	mutex_unlock(&marea_lock);
+	return found;
+}
+
+static bool pb_data_seen(pid_t tgid, unsigned long page, unsigned long handler_epoch)
+{
+	struct marea *seen;
+	bool found = false;
+
+	mutex_lock(&marea_lock);
+	list_for_each_entry(seen, &data_seen, list) {
+		if (seen->tgid == tgid && seen->addr == page &&
+		    seen->epoch == handler_epoch) {
+			found = true;
+			break;
+		}
+	}
+	mutex_unlock(&marea_lock);
+	return found;
+}
+
+static void pb_data_mark(pid_t tgid, unsigned long page, unsigned long handler_epoch)
+{
+	struct marea *seen;
+
+	seen = new_marea(tgid, page, 0);
+	if (!seen)
+		return;
+	seen->epoch = handler_epoch;
+	mutex_lock(&marea_lock);
+	list_add(&seen->list, &data_seen);
+	mutex_unlock(&marea_lock);
+}
+
+static void pb_trace_line(unsigned long ip, unsigned long data_va, unsigned long epoch)
+{
+	char line[96];
+
+	snprintf(line, sizeof(line), "%lx %lx %lu\n", ip, data_va, epoch);
+	pb_log_line("/tmp/pagedrop.trace", line);
+}
+
+static int pb_handle_data(unsigned long address)
+{
+	unsigned long ip = pb_fault_ip();
+	unsigned long page = address & PAGE_MASK;
+	unsigned long handler_epoch = 0;
+	unsigned long ep = 0;
+	pid_t tgid = current->tgid;
+	struct pt_regs *regs;
+
+	if (page < data_lo || page >= data_hi)
+		return 0;
+	if (!pb_ip_tracked(ip, &handler_epoch))
+		return 0;
+	regs = kzalloc(sizeof(*regs), GFP_KERNEL);
+	if (!regs)
+		return 0;
+	pb_set_arg(regs, 0, page);
+	pb_set_arg(regs, 1, PAGE_SIZE);
+	pb_set_arg(regs, 2, PROT_READ | PROT_WRITE);
+	if (real_sys_mprotect(regs)) {
+		kfree(regs);
+		return 0;
+	}
+	kfree(regs);
+	if (!pb_data_seen(tgid, page, handler_epoch)) {
+		if (dump_to_file(page, PAGE_SIZE, "read", &ep) == 0)
+			pb_data_mark(tgid, page, handler_epoch);
+	}
+	pb_trace_line(ip, page, ep);
+	return 1;
 }
 
 static bool pb_fault_is_instr(void)
@@ -782,6 +1056,9 @@ static asmlinkage int fh_force_sig_fault(int sig, int code, void __user *addr)
 	if (!pb_is_target() || sig != SIGSEGV)
 		return real_force_sig_fault(sig, code, addr);
 
+	if (data_on && pb_fault_is_read() && pb_handle_data(address))
+		return 0;
+
 	if (!pb_take_page(address, &page_addr, &new_prot))
 		return real_force_sig_fault(sig, code, addr);
 
@@ -801,7 +1078,8 @@ static asmlinkage int fh_force_sig_fault(int sig, int code, void __user *addr)
 	}
 
 	if (pb_fault_is_instr()) {
-		dump_to_file(page_addr, PAGE_SIZE);
+		dump_to_file(page_addr, PAGE_SIZE, "fault", NULL);
+		pb_try_arm();
 		new_prot &= ~PROT_WRITE;
 		pb_set_arg(regs, 2, new_prot);
 		real_sys_mprotect(regs);
@@ -815,7 +1093,11 @@ static asmlinkage int fh_force_sig_fault(int sig, int code, void __user *addr)
 
 static bool pb_name_matches(const char *name)
 {
-	return path && path[0] && name && name[0] && strstr(name, path);
+	if (!path || !path[0] || !name || !name[0])
+		return false;
+	if (exact)
+		return strcmp(name, path) == 0;
+	return strstr(name, path) != NULL;
 }
 
 static bool pb_user_path_matches(const char __user *uname)
@@ -867,8 +1149,15 @@ static bool pb_fd_path_matches(int fd)
 
 static void pb_move_tracked(struct list_head *saved)
 {
+	struct marea *entry, *tmp;
+	pid_t tgid = current->tgid;
+
 	mutex_lock(&marea_lock);
-	list_splice_init(&marea_list, saved);
+	list_for_each_entry_safe(entry, tmp, &marea_list, list) {
+		if (entry->tgid != tgid)
+			continue;
+		list_move(&entry->list, saved);
+	}
 	mutex_unlock(&marea_lock);
 }
 
@@ -891,7 +1180,6 @@ static long pb_finish_exec(struct list_head *saved, bool matched, long ret)
 		return ret;
 	}
 	mutex_lock(&marea_lock);
-	clear_tracked_locked();
 	list_splice_init(saved, &marea_list);
 	mutex_unlock(&marea_lock);
 	return ret;
@@ -1130,6 +1418,17 @@ static int fh_init(void)
 		pr_err("missing path= module parameter\n");
 		return -EINVAL;
 	}
+	if (data && data[0]) {
+		unsigned long a, b;
+
+		if (sscanf(data, "%lx-%lx", &a, &b) != 2 || b <= a) {
+			pr_err("bad data= range\n");
+			return -EINVAL;
+		}
+		data_lo = a & PAGE_MASK;
+		data_hi = (b + PAGE_SIZE - 1) & PAGE_MASK;
+		data_on = 1;
+	}
 
 	err = pb_install_hooks();
 	if (err)
@@ -1144,6 +1443,9 @@ static void fh_exit(void)
 {
 	pb_remove_hooks();
 	clear_tracked();
+	mutex_lock(&marea_lock);
+	pb_free_list(&data_seen);
+	mutex_unlock(&marea_lock);
 	pb_tgid_clear();
 	pr_info("unloaded\n");
 }

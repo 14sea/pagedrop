@@ -11,3 +11,7 @@ userland/c/simple
 userland/c/upxtest
 userland/c/upxtest.orig
 userland/c/extra
+userland/c/regress
+*.orig
+*.upx
+*.vmp

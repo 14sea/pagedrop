@@ -16,6 +16,8 @@
 #define EPOCH_ADDR 0x250000000UL
 #define FAIL_ADDR 0x230000000UL
 #define TAG_ADDR 0x240000000UL
+#define READ_DATA 0x260000000UL
+#define READ_CODE 0x261000000UL
 #define TAG_BYTE 0x5aUL
 
 static sigjmp_buf fault_env;
@@ -244,6 +246,108 @@ static int do_payload(void)
 	return 0;
 }
 
+static int trace_has(unsigned long va)
+{
+	FILE *f;
+	char line[128];
+	int found = 0;
+
+	f = fopen("/tmp/pagedrop.trace", "r");
+	if (!f)
+		return 0;
+	while (fgets(line, sizeof(line), f)) {
+		unsigned long ip, data;
+		unsigned long epoch;
+
+		if (sscanf(line, "%lx %lx %lu", &ip, &data, &epoch) != 3)
+			continue;
+		if (data == va) {
+			found = 1;
+			break;
+		}
+	}
+	fclose(f);
+	return found;
+}
+
+static int do_read(void)
+{
+	unsigned char *data;
+	unsigned char *code;
+	unsigned char buf[16];
+	int fd;
+	DIR *d;
+	struct dirent *de;
+	int dumped = 0;
+
+	data = map_fixed(READ_DATA, PROT_READ | PROT_WRITE);
+	code = map_fixed(READ_CODE, PROT_READ | PROT_WRITE);
+	if (!data || !code) {
+		perror("read mmap");
+		return 1;
+	}
+	memcpy(data, "BYTECODE", 8);
+#if defined(__aarch64__)
+	{
+		uint32_t *w = (uint32_t *)code;
+
+		w[0] = 0xd2800001;
+		w[1] = 0xf2ac0001;
+		w[2] = 0xf2c00041;
+		w[3] = 0xf9400020;
+		w[4] = 0xd65f03c0;
+	}
+#else
+	{
+		unsigned char stub[] = {
+			0x48, 0xb8, 0x00, 0x00, 0x00, 0x60, 0x02, 0x00, 0x00, 0x00,
+			0x48, 0x8b, 0x00,
+			0xc3
+		};
+		memcpy(code, stub, sizeof(stub));
+	}
+#endif
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0) {
+		perror("read rx");
+		return 1;
+	}
+	arm_fault();
+	if (!call_ok(code)) {
+		fprintf(stderr, "read: load fault was not swallowed\n");
+		return 1;
+	}
+	if (!trace_has(READ_DATA)) {
+		fprintf(stderr, "read: trace missing\n");
+		return 1;
+	}
+	d = opendir("/tmp");
+	if (!d)
+		return 1;
+	while ((de = readdir(d))) {
+		unsigned long addr, epoch;
+		char path[320];
+
+		if (sscanf(de->d_name, "%lx_%lu", &addr, &epoch) != 2)
+			continue;
+		if (addr != READ_DATA)
+			continue;
+		snprintf(path, sizeof(path), "/tmp/%s", de->d_name);
+		fd = open(path, O_RDONLY);
+		if (fd < 0)
+			continue;
+		if (read(fd, buf, 8) == 8 && memcmp(buf, "BYTECODE", 8) == 0)
+			dumped = 1;
+		close(fd);
+	}
+	closedir(d);
+	if (!dumped) {
+		fprintf(stderr, "read: data page not dumped\n");
+		return 1;
+	}
+	printf("read ok\n");
+	return 0;
+}
+
 static int do_execve(void)
 {
 	char *argv[] = {"notme", NULL};
@@ -323,6 +427,8 @@ int main(int argc, char **argv)
 		return do_flip();
 	if (!strcmp(argv[1], "fail"))
 		return do_fail();
+	if (!strcmp(argv[1], "read"))
+		return do_read();
 	if (!strcmp(argv[1], "execve"))
 		return do_execve();
 	if (!strcmp(argv[1], "execveat"))
@@ -331,6 +437,6 @@ int main(int argc, char **argv)
 	if (!strcmp(argv[1], "tag"))
 		return do_tag();
 #endif
-	fprintf(stderr, "usage: extra epoch|flip|fail|execve|execveat|tag\n");
+	fprintf(stderr, "usage: extra epoch|flip|fail|read|execve|execveat|tag\n");
 	return 2;
 }

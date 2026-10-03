@@ -26,6 +26,8 @@ rm -f /tmp/upxtest
 upx -q -o /tmp/upxtest /tmp/upxtest.orig
 gcc -O0 -o /tmp/pb_check tools/x86/pb_check.c
 gcc -O0 -o /tmp/pb_addr tools/x86/pb_addr.c
+python3 tools/test_pb_rank.py
+mark $? pb_rank
 
 say "hooks"
 sudo rm -f /tmp/[0-9a-f]*_[0-9]*
@@ -97,6 +99,13 @@ sudo rm -f /tmp/[0-9a-f]*_[0-9]*
 sudo insmod ./pagedrop.ko path=extra
 ./userland/c/extra flip
 mark "$?" "flip"
+
+say "read"
+sudo rmmod pagedrop 2>/dev/null || true
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+sudo insmod ./pagedrop.ko path=extra data=260000000-260001000
+./userland/c/extra read
+mark "$?" "read"
 
 say "execfail"
 sudo rmmod pagedrop 2>/dev/null || true

@@ -4,7 +4,7 @@ LDFLAGS ?= -pthread
 
 .PHONY: all clean
 
-all: capture sigsegv.out simple upxtest extra
+all: capture sigsegv.out simple upxtest extra regress
 
 capture: capture.c
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
@@ -21,5 +21,8 @@ upxtest: upxtest.c
 extra: extra.c
 	$(CC) $(CFLAGS) -o $@ $<
 
+regress: regress.c
+	$(CC) $(CFLAGS) -o $@ $<
+
 clean:
-	rm -f capture sigsegv.out simple upxtest upxtest.orig extra
+	rm -f capture sigsegv.out simple upxtest upxtest.orig extra regress

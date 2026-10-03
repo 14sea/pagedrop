@@ -87,6 +87,8 @@ tools/arm64/run_tests.sh
 
 Both passed. x86_64 was Ubuntu 24.04, kernel 6.8.0-101-generic, ftrace, UPX 4.2.2. arm64 was Raspberry Pi 4, Debian 12, kernel 6.6.62+rpt-rpi-v8, kprobes, UPX 5.0.2. UPX 4.2.2's static arm64 stub hits `SIGILL` on that board with the module unloaded. Pi 4 has no protection keys and no MTE. `pkey_mprotect` is still hooked. A tagged fault address is checked on arm64 only.
 
+A plain C program, packed with UPX and with the VMProtect demo, is compared in [docs/orig-upx-vmp.md](docs/orig-upx-vmp.md). The dumps are easier to read than either packed file. They are not easier than the original, and a fully virtualized function is still absent from them.
+
 | Use case | x86_64 | arm64 |
 |---|---|---|
 | 12 hooks install, clean `rmmod` | pass | pass |
@@ -117,6 +119,14 @@ So, just `insmod` the module and pass the name of the process as argument. Then,
 insmod pagedrop.ko path=sigsegv.out
 ./sigsegv.out
 ```
+
+`path=` is a substring. `exact=1` matches it exactly. `data=start-end` (hex) arms that range. A read of it from a tracked executable page is dumped once per handler epoch, and `ip`, `data_va`, `epoch` are appended to `/tmp/pagedrop.trace`. `/tmp/pagedrop.index` records `tgid`, `comm`, `va`, `epoch`, and why for every dump.
+
+```sh
+python3 tools/pb_rank.py --file ./regress.vmp --tgid 1234
+```
+
+That keeps one `tgid`. If several are present and `--tgid` is omitted, it lists them and exits 2. It drops a dump whose bytes match `libc`, `ld-linux`, `libstdc++`, or an executable `PT_LOAD` of `--file`. What remains is ranked with bytes missing from the on-disk file above bytes that are in it, `mprotect` and `fault` above `mmap`, and a later epoch above an earlier one. Pass other libraries with `--lib`.
 
 Inside the `/tmp` directory, you will find all the timestamped dumps.
 
