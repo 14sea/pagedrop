@@ -2,6 +2,8 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
 #include <setjmp.h>
 #include <signal.h>
 #include <stdint.h>
@@ -10,6 +12,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #define PAGE 4096
@@ -18,6 +21,7 @@
 #define TAG_ADDR 0x240000000UL
 #define READ_DATA 0x260000000UL
 #define READ_CODE 0x261000000UL
+#define MOVED_ADDR 0x270000000UL
 #define TAG_BYTE 0x5aUL
 
 static sigjmp_buf fault_env;
@@ -348,6 +352,1008 @@ static int do_read(void)
 	return 0;
 }
 
+#if defined(__aarch64__)
+static unsigned char *tagrace_ptr;
+static volatile int tagrace_stop;
+static volatile int tagrace_bad;
+
+static void *tagrace_worker(void *arg)
+{
+	unsigned long tag = (unsigned long)arg;
+	unsigned char *p = (unsigned char *)(READ_DATA | (tag << 56));
+	int i;
+
+	for (i = 0; i < 4000 && !tagrace_stop; i++) {
+		if (sigsetjmp(fault_env, 1) == 0) {
+			volatile unsigned char x = *p;
+
+			(void)x;
+		} else {
+			tagrace_bad++;
+		}
+	}
+	return NULL;
+}
+
+static int do_tagrace(void)
+{
+	pthread_t th[4];
+	unsigned char *code;
+	int i;
+
+	arm_fault();
+	tagrace_ptr = map_fixed(READ_DATA, PROT_READ | PROT_WRITE);
+	code = map_fixed(READ_CODE, PROT_READ | PROT_WRITE);
+	if (!tagrace_ptr || !code) {
+		perror("tagrace mmap");
+		return 1;
+	}
+	/* A code page mprotected to execute is what arms the data range. */
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0) {
+		perror("tagrace rx");
+		return 1;
+	}
+	tagrace_stop = 0;
+	for (i = 0; i < 4; i++)
+		if (pthread_create(&th[i], NULL, tagrace_worker,
+				   (void *)(unsigned long)(TAG_BYTE + i)) != 0)
+			return 1;
+	for (i = 0; i < 4; i++)
+		pthread_join(th[i], NULL);
+	/*
+	 * The threads must have read the right byte. Without the module the
+	 * page is never made inaccessible, so a read fault here is the
+	 * module failing to restore a tagged access, which is the whole
+	 * point of the case.
+	 */
+	if (tagrace_bad) {
+		fprintf(stderr, "tagrace: %d tagged reads faulted\n", tagrace_bad);
+		return 1;
+	}
+	printf("tagrace ok\n");
+	return 0;
+}
+#endif
+
+static unsigned char *forkread_ptr;
+static volatile int forkread_stop;
+
+static void *forkread_reader(void *arg)
+{
+	int i;
+
+	(void)arg;
+	/* Keep touching the armed page while the main thread forks, so a
+	 * child can be born and fault on the same page the parent is using. */
+	for (i = 0; i < 20000 && !forkread_stop; i++) {
+		if (sigsetjmp(fault_env, 1) == 0) {
+			volatile unsigned char x = *forkread_ptr;
+
+			(void)x;
+		}
+	}
+	return NULL;
+}
+
+static int do_forkread(void)
+{
+	unsigned char *data;
+	unsigned char *code;
+	pthread_t reader;
+	pid_t pid;
+	int st;
+	int i;
+	int bad = 0;
+
+	data = map_fixed(READ_DATA, PROT_READ | PROT_WRITE);
+	code = map_fixed(READ_CODE, PROT_READ | PROT_WRITE);
+	if (!data || !code) {
+		perror("forkread mmap");
+		return 1;
+	}
+	memcpy(data, "BYTECODE", 8);
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0) {
+		perror("forkread rx");
+		return 1;
+	}
+	arm_fault();
+	forkread_ptr = data;
+	forkread_stop = 0;
+	if (pthread_create(&reader, NULL, forkread_reader, NULL) != 0)
+		return 1;
+	/* Fork repeatedly while the reader is walking the armed page. Every
+	 * child shares those page tables, so each one can fault on a page the
+	 * module armed for the parent. */
+	for (i = 0; i < 200; i++) {
+		pid = fork();
+		if (pid < 0) {
+			bad++;
+			break;
+		}
+		if (pid == 0) {
+			volatile unsigned char x = data[0];
+
+			_exit(x == 'B' ? 0 : 1);
+		}
+		if (waitpid(pid, &st, 0) < 0) {
+			bad++;
+			break;
+		}
+		if (!WIFEXITED(st) || WEXITSTATUS(st) != 0)
+			bad++;
+	}
+	forkread_stop = 1;
+	pthread_join(reader, NULL);
+	if (bad) {
+		fprintf(stderr, "forkread: %d of 200 children failed\n", bad);
+		return 1;
+	}
+	printf("forkread ok\n");
+	return 0;
+}
+
+static unsigned char *dumprace_ptr;
+
+static void *dumprace_worker(void *arg)
+{
+	pthread_barrier_t *bar = arg;
+	volatile unsigned char x;
+
+	pthread_barrier_wait(bar);
+	x = *dumprace_ptr;
+	(void)x;
+	return NULL;
+}
+
+static int do_dumprace(void)
+{
+	unsigned char *data;
+	unsigned char *code;
+	pthread_t th[8];
+	pthread_barrier_t bar;
+	FILE *f;
+	char line[128];
+	int i;
+	int n = 0;
+
+	data = map_fixed(READ_DATA, PROT_READ | PROT_WRITE);
+	code = map_fixed(READ_CODE, PROT_READ | PROT_WRITE);
+	if (!data || !code) {
+		perror("dumprace mmap");
+		return 1;
+	}
+	memset(data, 0x42, PAGE);
+	dumprace_ptr = data;
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0)
+		return 1;
+	pthread_barrier_init(&bar, NULL, 8);
+	for (i = 0; i < 8; i++)
+		pthread_create(&th[i], NULL, dumprace_worker, &bar);
+	for (i = 0; i < 8; i++)
+		pthread_join(th[i], NULL);
+	pthread_barrier_destroy(&bar);
+	f = fopen("/tmp/pagedrop.trace", "r");
+	if (!f) {
+		fprintf(stderr, "dumprace: no trace file\n");
+		return 1;
+	}
+	while (fgets(line, sizeof(line), f)) {
+		unsigned long ip, va, epoch;
+
+		if (sscanf(line, "%lx %lx %lu", &ip, &va, &epoch) == 3 && va == READ_DATA)
+			n++;
+	}
+	fclose(f);
+	if (n != 1) {
+		fprintf(stderr, "dumprace: %d trace lines, want 1\n", n);
+		return 1;
+	}
+	printf("dumprace ok\n");
+	return 0;
+}
+
+static unsigned char *armrace_ptr;
+static unsigned char *armrace_code;
+static volatile int armrace_stop;
+
+static void *armrace_reloader(void *arg)
+{
+	int i;
+
+	(void)arg;
+	for (i = 0; i < 2000 && !armrace_stop; i++) {
+		mprotect(armrace_ptr, PAGE, PROT_READ | PROT_WRITE);
+		mprotect(armrace_code, PAGE, PROT_READ | PROT_EXEC);
+	}
+	armrace_stop = 1;
+	return NULL;
+}
+
+static void *armrace_reader(void *arg)
+{
+	int i;
+
+	(void)arg;
+	for (i = 0; i < 2000 && !armrace_stop; i++) {
+		volatile unsigned char x = *armrace_ptr;
+
+		(void)x;
+	}
+	return NULL;
+}
+
+static int do_armrace(void)
+{
+	pthread_t r, w;
+
+	armrace_ptr = map_fixed(READ_DATA, PROT_READ | PROT_WRITE);
+	armrace_code = map_fixed(READ_CODE, PROT_READ | PROT_WRITE);
+	if (!armrace_ptr || !armrace_code) {
+		perror("armrace mmap");
+		return 1;
+	}
+	memset(armrace_ptr, 0x42, PAGE);
+	if (mprotect(armrace_code, PAGE, PROT_READ | PROT_EXEC) != 0)
+		return 1;
+	armrace_stop = 0;
+	if (pthread_create(&r, NULL, armrace_reader, NULL) != 0)
+		return 1;
+	if (pthread_create(&w, NULL, armrace_reloader, NULL) != 0)
+		return 1;
+	pthread_join(w, NULL);
+	pthread_join(r, NULL);
+	printf("armrace ok\n");
+	return 0;
+}
+
+static volatile int mremap_stop;
+#define MOVE_N 64
+#define MOVE_FIRST 0x260000000UL
+#define MOVE_ALT 0x260010000UL
+
+static void *mremap_reader(void *arg)
+{
+	int i;
+
+	(void)arg;
+	for (i = 0; i < MOVE_N * 200 && !mremap_stop; i++) {
+		volatile unsigned char x = *(volatile unsigned char *)MOVE_ALT;
+
+		(void)x;
+	}
+	return NULL;
+}
+
+static int do_mremaprace(void)
+{
+	unsigned char *code;
+	pthread_t r;
+	int i;
+	int moved = 0;
+
+	code = map_fixed(READ_CODE, PROT_READ | PROT_WRITE);
+	if (!code) {
+		perror("mremaprace mmap");
+		return 1;
+	}
+	for (i = 0; i < MOVE_N; i++)
+		if (!map_fixed(MOVE_FIRST + (unsigned long)i * PAGE,
+			       PROT_READ | PROT_WRITE))
+			return 1;
+	/* ALT starts as a plain mapping and is never unmapped afterwards. */
+	if (!map_fixed(MOVE_ALT, PROT_READ | PROT_WRITE))
+		return 1;
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0)
+		return 1;
+	pthread_create(&r, NULL, mremap_reader, NULL);
+	for (i = 0; i < MOVE_N; i++) {
+		if (mremap((void *)(MOVE_FIRST + (unsigned long)i * PAGE), PAGE, PAGE,
+			   MREMAP_MAYMOVE | MREMAP_FIXED, (void *)MOVE_ALT) == MAP_FAILED)
+			break;
+		moved++;
+	}
+	mremap_stop = 1;
+	pthread_join(r, NULL);
+	if (!moved) {
+		fprintf(stderr, "mremaprace: no moves\n");
+		return 1;
+	}
+	printf("mremaprace ok\n");
+	return 0;
+}
+
+static unsigned char *datarace_ptr;
+static volatile int datarace_stop;
+
+static void *datarace_storm(void *arg)
+{
+	int i;
+
+	(void)arg;
+	/* Both of these are x-only or plain, so each one arms and each one
+	 * disarms the data range while the reader is walking over it. */
+	for (i = 0; i < 3000 && !datarace_stop; i++) {
+		mprotect(datarace_ptr, PAGE, PROT_READ | PROT_EXEC);
+		mprotect(datarace_ptr, PAGE, PROT_READ | PROT_WRITE);
+	}
+	datarace_stop = 1;
+	return NULL;
+}
+
+static void *datarace_reader(void *arg)
+{
+	int i;
+
+	(void)arg;
+	/* No signal handler on purpose: the page is only ever RW or RX here,
+	 * so the only faults available are the ones the module invented. */
+	for (i = 0; i < 8000 && !datarace_stop; i++) {
+		volatile unsigned char x = *datarace_ptr;
+
+		(void)x;
+	}
+	return NULL;
+}
+
+static int do_datarace(void)
+{
+	pthread_t storm, reader;
+	unsigned char *code;
+
+	datarace_ptr = map_fixed(READ_DATA, PROT_READ | PROT_WRITE);
+	code = map_fixed(READ_CODE, PROT_READ | PROT_WRITE);
+	if (!datarace_ptr || !code) {
+		perror("datarace mmap");
+		return 1;
+	}
+	memset(datarace_ptr, 0x42, PAGE);
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0)
+		return 1;
+	datarace_stop = 0;
+	if (pthread_create(&storm, NULL, datarace_storm, NULL) != 0)
+		return 1;
+	if (pthread_create(&reader, NULL, datarace_reader, NULL) != 0)
+		return 1;
+	pthread_join(storm, NULL);
+	pthread_join(reader, NULL);
+	printf("datarace ok\n");
+	return 0;
+}
+
+static unsigned char *munmaprace_ptr;
+static volatile int munmaprace_stop;
+static volatile sig_atomic_t munmaprace_faults;
+
+static void munmaprace_fault(int sig)
+{
+	(void)sig;
+	munmaprace_faults++;
+}
+
+static void *munmaprace_reader(void *arg)
+{
+	int i;
+
+	(void)arg;
+	for (i = 0; i < 8000 && !munmaprace_stop; i++) {
+		if (sigsetjmp(fault_env, 1) == 0) {
+			volatile unsigned char x = *munmaprace_ptr;
+
+			(void)x;
+		}
+	}
+	return NULL;
+}
+
+static int do_munmaprace(void)
+{
+	pthread_t r;
+	struct sigaction sa;
+	unsigned char *code;
+
+	munmaprace_ptr = map_fixed(READ_DATA, PROT_READ | PROT_WRITE);
+	code = map_fixed(READ_CODE, PROT_READ | PROT_WRITE);
+	if (!munmaprace_ptr || !code) {
+		perror("munmaprace mmap");
+		return 1;
+	}
+	memset(munmaprace_ptr, 0x42, PAGE);
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0)
+		return 1;
+	memset(&sa, 0, sizeof(sa));
+	sa.sa_handler = munmaprace_fault;
+	sigaction(SIGSEGV, &sa, NULL);
+	arm_fault();
+	munmaprace_stop = 0;
+	munmaprace_faults = 0;
+	if (pthread_create(&r, NULL, munmaprace_reader, NULL) != 0)
+		return 1;
+	/* Drop the page out from under the reader. The fault it takes is the
+	 * program's own doing, so a handler is installed and the test only
+	 * requires that the module neither wedges nor panics. */
+	if (munmap(munmaprace_ptr, PAGE) != 0) {
+		pthread_join(r, NULL);
+		perror("munmaprace munmap");
+		return 1;
+	}
+	usleep(20000);
+	munmaprace_stop = 1;
+	pthread_join(r, NULL);
+	printf("munmaprace ok faults %d\n", (int)munmaprace_faults);
+	return 0;
+}
+
+static unsigned char *clonevm_ptr;
+
+static void *clonevm_reader(void *arg)
+{
+	volatile unsigned char x;
+
+	(void)arg;
+	x = *clonevm_ptr;
+	return (void *)(long)(x == 'B');
+}
+
+static int do_clonevm(void)
+{
+	unsigned char *data;
+	unsigned char *code;
+	pthread_t a;
+	pthread_t b;
+	void *ra = NULL;
+	void *rb = NULL;
+
+	data = map_fixed(READ_DATA, PROT_READ | PROT_WRITE);
+	code = map_fixed(READ_CODE, PROT_READ | PROT_WRITE);
+	if (!data || !code) {
+		perror("clonevm mmap");
+		return 1;
+	}
+	memcpy(data, "BYTECODE", 8);
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0) {
+		perror("clonevm rx");
+		return 1;
+	}
+	/*
+	 * Two threads of one tgid racing the same armed page. This is the
+	 * shape a raw CLONE_VM without CLONE_THREAD would give: a second
+	 * execution context over the same page tables, with the module
+	 * restoring the page underneath both of them.
+	 */
+	clonevm_ptr = data;
+	if (pthread_create(&a, NULL, clonevm_reader, NULL) != 0)
+		return 1;
+	if (pthread_create(&b, NULL, clonevm_reader, NULL) != 0)
+		return 1;
+	pthread_join(a, &ra);
+	pthread_join(b, &rb);
+	if (ra != (void *)(long)1 || rb != (void *)(long)1) {
+		fprintf(stderr, "clonevm: a thread read the wrong byte\n");
+		return 1;
+	}
+	printf("clonevm ok\n");
+	return 0;
+}
+
+static unsigned char *execrace_ptr;
+
+static void *execrace_reader(void *arg)
+{
+	int i;
+
+	(void)arg;
+	for (i = 0; i < 20000; i++) {
+		if (sigsetjmp(fault_env, 1) == 0) {
+			volatile unsigned char x = *execrace_ptr;
+
+			(void)x;
+		}
+	}
+	return NULL;
+}
+
+static int do_execrace(void)
+{
+	pthread_t r[4];
+	unsigned char *data;
+	unsigned char *code;
+	char *argv[] = {"stalehelper", NULL};
+	char *envp[] = {NULL};
+	int i;
+
+	data = map_fixed(READ_DATA, PROT_READ | PROT_WRITE);
+	code = map_fixed(READ_CODE, PROT_READ | PROT_WRITE);
+	if (!data || !code) {
+		perror("execrace mmap");
+		return 1;
+	}
+	memset(data, 0x42, PAGE);
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0)
+		return 1;
+	execrace_ptr = data;
+	arm_fault();
+	for (i = 0; i < 4; i++)
+		if (pthread_create(&r[i], NULL, execrace_reader, NULL) != 0)
+			return 1;
+	/* Exec while the readers are inside the page. The readers are killed
+	 * with the old image, which is the point: pb_do_exec drops the data
+	 * state for this tgid while faults are in flight. */
+	execve("/tmp/stalehelper", argv, envp);
+	perror("execrace execve");
+	return 1;
+}
+
+static int do_maymove(void)
+{
+	unsigned char *code;
+	void *p;
+	unsigned long a;
+	int i;
+	int moved = 0;
+	int relocated = 0;
+
+	code = map_fixed(READ_CODE, PROT_READ | PROT_WRITE);
+	if (!code) {
+		perror("maymove mmap");
+		return 1;
+	}
+	for (i = 0; i < 32; i++)
+		if (!map_fixed(0x260000000UL + (unsigned long)i * PAGE,
+			       PROT_READ | PROT_WRITE))
+			return 1;
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0)
+		return 1;
+
+	/*
+	 * The premise the module's guard rests on. Measured on 6.8, a
+	 * same-size MREMAP_MAYMOVE keeps the address, so fh_sys_mremap only
+	 * has to release armed pages when the size changes. If a kernel ever
+	 * relocates a same-size move, that guard is incomplete and there is
+	 * an arming window with no way to place a record ahead of the move.
+	 * Say so rather than let the hardening pass silently.
+	 */
+	a = 0x260000000UL;
+	p = mremap((void *)a, PAGE, PAGE, MREMAP_MAYMOVE, (void *)0);
+	if (p == MAP_FAILED) {
+		perror("maymove same size");
+		return 1;
+	}
+	if ((unsigned long)p != a) {
+		relocated = 1;
+		printf("maymove: same-size move relocated %lx to %lx\n", a,
+		       (unsigned long)p);
+	} else {
+		/* Put the page back where the loop below expects it. */
+		if (mremap(p, PAGE, PAGE, MREMAP_MAYMOVE, (void *)a) == MAP_FAILED) {
+			perror("maymove restore");
+			return 1;
+		}
+	}
+
+	/* Now the size-changing case the hardening does cover. */
+	for (i = 0; i < 32; i++) {
+		unsigned long s = 0x260000000UL + (unsigned long)i * PAGE;
+
+		if (!map_fixed(s + PAGE, PROT_READ | PROT_WRITE))
+			break;
+		if (mremap((void *)s, PAGE, 2 * PAGE, MREMAP_MAYMOVE,
+			   (void *)0) == MAP_FAILED)
+			break;
+		moved++;
+	}
+	if (!moved) {
+		fprintf(stderr, "maymove: no size-changing moves\n");
+		return 1;
+	}
+	if (relocated)
+		return 1;
+	printf("maymove ok %d\n", moved);
+	return 0;
+}
+
+static int do_forkrace(void)
+{
+	unsigned char *data;
+	unsigned char *code;
+	int i;
+	int bad = 0;
+
+	data = map_fixed(READ_DATA, PROT_READ | PROT_WRITE);
+	code = map_fixed(READ_CODE, PROT_READ | PROT_WRITE);
+	if (!data || !code) {
+		perror("forkrace mmap");
+		return 1;
+	}
+	memcpy(data, "BYTECODE", 8);
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0)
+		return 1;
+	for (i = 0; i < 200; i++) {
+		pid_t pid = fork();
+		int st;
+
+		if (pid < 0)
+			return 1;
+		if (pid == 0) {
+			volatile unsigned char x = data[0];
+
+			_exit(x == 'B' ? 0 : 1);
+		}
+		if (waitpid(pid, &st, 0) < 0)
+			return 1;
+		if (!WIFEXITED(st) || WEXITSTATUS(st) != 0)
+			bad++;
+	}
+	if (bad) {
+		fprintf(stderr, "forkrace: %d of 200 children failed\n", bad);
+		return 1;
+	}
+	printf("forkrace ok\n");
+	return 0;
+}
+
+static int do_roarm(void)
+{
+	unsigned char *data;
+	unsigned char *code;
+
+	data = map_fixed(READ_DATA, PROT_READ | PROT_WRITE);
+	code = map_fixed(READ_CODE, PROT_READ | PROT_WRITE);
+	if (!data || !code) {
+		perror("roarm mmap");
+		return 1;
+	}
+	memcpy(data, "BYTECODE", 8);
+	if (mprotect(data, PAGE, PROT_READ) != 0) {
+		perror("roarm ro");
+		return 1;
+	}
+#if defined(__aarch64__)
+	{
+		uint32_t *w = (uint32_t *)code;
+
+		w[0] = 0xd2800001;
+		w[1] = 0xf2ac0001;
+		w[2] = 0xf2c00041;
+		w[3] = 0xf9400020;
+		w[4] = 0xd65f03c0;
+	}
+#else
+	{
+		unsigned char stub[] = {
+			0x48, 0xb8, 0x00, 0x00, 0x00, 0x60, 0x02, 0x00, 0x00, 0x00,
+			0x48, 0x8b, 0x00,
+			0xc3
+		};
+		memcpy(code, stub, sizeof(stub));
+	}
+#endif
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0) {
+		perror("roarm rx");
+		return 1;
+	}
+	arm_fault();
+	if (!call_ok(code)) {
+		fprintf(stderr, "roarm: load fault was not swallowed\n");
+		return 1;
+	}
+	faulted = 0;
+	if (sigsetjmp(fault_env, 1) == 0)
+		data[0] = 0x41;
+	if (!faulted) {
+		fprintf(stderr, "roarm: write was allowed\n");
+		return 1;
+	}
+	printf("roarm ok\n");
+	return 0;
+}
+
+static int do_moveread(void)
+{
+	unsigned char *data;
+	unsigned char *code;
+	unsigned char *moved;
+
+	data = map_fixed(READ_DATA, PROT_READ | PROT_WRITE);
+	code = map_fixed(READ_CODE, PROT_READ | PROT_WRITE);
+	if (!data || !code) {
+		perror("moveread mmap");
+		return 1;
+	}
+	memcpy(data, "BYTECODE", 8);
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0) {
+		perror("moveread rx");
+		return 1;
+	}
+	moved = mremap(data, PAGE, PAGE, MREMAP_MAYMOVE | MREMAP_FIXED,
+		       (void *)MOVED_ADDR);
+	if (moved == MAP_FAILED) {
+		perror("moveread mremap");
+		return 1;
+	}
+	arm_fault();
+	faulted = 0;
+	if (sigsetjmp(fault_env, 1) == 0) {
+		volatile unsigned char x = moved[0];
+
+		(void)x;
+	}
+	if (faulted) {
+		fprintf(stderr, "moveread: fault after mremap\n");
+		return 1;
+	}
+	printf("moveread ok\n");
+	return 0;
+}
+
+static int do_rearm(void)
+{
+	unsigned char *data;
+	unsigned char *code;
+	volatile unsigned char x;
+
+	data = map_fixed(READ_DATA, PROT_READ | PROT_WRITE);
+	code = map_fixed(READ_CODE, PROT_READ | PROT_WRITE);
+	if (!data || !code) {
+		perror("rearm mmap");
+		return 1;
+	}
+	memcpy(data, "OLDDATA!", 8);
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0)
+		return 1;
+	x = data[0];
+	if (!trace_has(READ_DATA)) {
+		fprintf(stderr, "rearm: first trace missing\n");
+		return 1;
+	}
+	if (truncate("/tmp/pagedrop.trace", 0) != 0)
+		return 1;
+	if (munmap(data, PAGE) != 0)
+		return 1;
+	data = map_fixed(READ_DATA, PROT_READ | PROT_WRITE);
+	if (!data)
+		return 1;
+	memcpy(data, "NEWDATA!", 8);
+	if (mprotect(code, PAGE, PROT_READ | PROT_WRITE) != 0)
+		return 1;
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0)
+		return 1;
+	x = data[0];
+	(void)x;
+	if (!trace_has(READ_DATA)) {
+		fprintf(stderr, "rearm: second trace missing\n");
+		return 1;
+	}
+	printf("rearm ok\n");
+	return 0;
+}
+
+static int do_fixed(void)
+{
+	unsigned char *data;
+	unsigned char *code;
+	volatile unsigned char x;
+
+	data = map_fixed(READ_DATA, PROT_READ | PROT_WRITE);
+	code = map_fixed(READ_CODE, PROT_READ | PROT_WRITE);
+	if (!data || !code) {
+		perror("fixed mmap");
+		return 1;
+	}
+	memcpy(data, "OLDDATA!", 8);
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0)
+		return 1;
+	x = data[0];
+	if (!trace_has(READ_DATA)) {
+		fprintf(stderr, "fixed: first trace missing\n");
+		return 1;
+	}
+	if (truncate("/tmp/pagedrop.trace", 0) != 0)
+		return 1;
+	data = map_fixed(READ_DATA, PROT_READ | PROT_WRITE);
+	if (!data)
+		return 1;
+	memcpy(data, "NEWDATA!", 8);
+	if (mprotect(code, PAGE, PROT_READ | PROT_WRITE) != 0)
+		return 1;
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0)
+		return 1;
+	x = data[0];
+	(void)x;
+	if (!trace_has(READ_DATA)) {
+		fprintf(stderr, "fixed: second trace missing\n");
+		return 1;
+	}
+	printf("fixed ok\n");
+	return 0;
+}
+
+static int do_pair(void)
+{
+	void *mine;
+	void *after;
+	pid_t pid;
+	int st;
+
+	mine = map_fixed(EPOCH_ADDR, PROT_READ | PROT_WRITE);
+	if (!mine) {
+		perror("pair mmap");
+		return 1;
+	}
+	plant(mine, "PARENT!!");
+	if (mprotect(mine, PAGE, PROT_READ | PROT_EXEC) != 0)
+		return 1;
+	pid = fork();
+	if (pid < 0)
+		return 1;
+	if (pid == 0) {
+		void *p = map_fixed(0x251000000UL, PROT_READ | PROT_WRITE);
+
+		if (!p)
+			_exit(1);
+		plant(p, "CHILD!!!");
+		if (mprotect(p, PAGE, PROT_READ | PROT_EXEC) != 0)
+			_exit(1);
+		if (!dump_exact(0x251000000UL, "CHILD!!!"))
+			_exit(1);
+		_exit(0);
+	}
+	if (waitpid(pid, &st, 0) < 0)
+		return 1;
+	if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+		fprintf(stderr, "pair: child failed\n");
+		return 1;
+	}
+	after = map_fixed(0x252000000UL, PROT_READ | PROT_WRITE);
+	if (!after)
+		return 1;
+	plant(after, "AFTER!!!");
+	if (mprotect(after, PAGE, PROT_READ | PROT_EXEC) != 0)
+		return 1;
+	if (!dump_exact(0x252000000UL, "AFTER!!!")) {
+		fprintf(stderr, "pair: parent lost tracking\n");
+		return 1;
+	}
+	printf("pair ok\n");
+	return 0;
+}
+
+static int do_vfork(void)
+{
+	pid_t pid;
+	int st;
+
+	pid = vfork();
+	if (pid < 0)
+		return 1;
+	if (pid == 0) {
+		execl("/bin/true", "true", (char *)NULL);
+		_exit(1);
+	}
+	if (waitpid(pid, &st, 0) < 0)
+		return 1;
+	if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+		fprintf(stderr, "vfork: child failed\n");
+		return 1;
+	}
+	printf("vfork ok\n");
+	return 0;
+}
+
+static int do_outside(void)
+{
+	unsigned char *p;
+	volatile unsigned char x;
+
+	p = map_fixed(0x262000000UL, PROT_READ | PROT_WRITE);
+	if (!p) {
+		perror("outside mmap");
+		return 1;
+	}
+	memcpy(p, "OUTSIDE!", 8);
+	x = p[0];
+	(void)x;
+	if (trace_has(0x262000000UL)) {
+		fprintf(stderr, "outside: traced\n");
+		return 1;
+	}
+	printf("outside ok\n");
+	return 0;
+}
+
+static int do_wrarm(void)
+{
+	unsigned char *data;
+	unsigned char *code;
+
+	data = map_fixed(READ_DATA, PROT_READ | PROT_WRITE);
+	code = map_fixed(READ_CODE, PROT_READ | PROT_WRITE);
+	if (!data || !code) {
+		perror("wrarm mmap");
+		return 1;
+	}
+	data[0] = 'A';
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0) {
+		perror("wrarm rx");
+		return 1;
+	}
+	arm_fault();
+	faulted = 0;
+	if (sigsetjmp(fault_env, 1) == 0)
+		data[0] = 'B';
+	if (faulted) {
+		fprintf(stderr, "wrarm: write fault was not swallowed\n");
+		return 1;
+	}
+	if (data[0] != 'B')
+		return 1;
+	printf("wrarm ok\n");
+	return 0;
+}
+
+static int do_noneexec(void)
+{
+	unsigned char *data;
+	unsigned char *code;
+
+	data = map_fixed(READ_DATA, PROT_READ | PROT_WRITE);
+	code = map_fixed(READ_CODE, PROT_READ | PROT_WRITE);
+	if (!data || !code) {
+		perror("noneexec mmap");
+		return 1;
+	}
+	plant(data, "MARKER!!");
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0)
+		return 1;
+	if (mprotect(data, PAGE, PROT_READ | PROT_EXEC) != 0) {
+		perror("noneexec rx");
+		return 1;
+	}
+	if (!dump_exact(READ_DATA, "MARKER!!")) {
+		fprintf(stderr, "noneexec: marker not dumped\n");
+		return 1;
+	}
+	printf("noneexec ok\n");
+	return 0;
+}
+
+static int do_disarm(void)
+{
+	unsigned char *data;
+	unsigned char *code;
+	volatile unsigned char x;
+
+	data = map_fixed(READ_DATA, PROT_READ | PROT_WRITE);
+	code = map_fixed(READ_CODE, PROT_READ | PROT_WRITE);
+	if (!data || !code) {
+		perror("disarm mmap");
+		return 1;
+	}
+	memcpy(data, "OLDDATA!", 8);
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0)
+		return 1;
+	x = data[0];
+	if (!trace_has(READ_DATA)) {
+		fprintf(stderr, "disarm: first trace missing\n");
+		return 1;
+	}
+	if (truncate("/tmp/pagedrop.trace", 0) != 0)
+		return 1;
+	if (mprotect(data, PAGE, PROT_READ | PROT_WRITE) != 0)
+		return 1;
+	if (mprotect(code, PAGE, PROT_READ | PROT_WRITE) != 0)
+		return 1;
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0)
+		return 1;
+	x = data[0];
+	(void)x;
+	if (!trace_has(READ_DATA)) {
+		fprintf(stderr, "disarm: second trace missing\n");
+		return 1;
+	}
+	printf("disarm ok\n");
+	return 0;
+}
+
 static int do_execve(void)
 {
 	char *argv[] = {"notme", NULL};
@@ -405,12 +1411,47 @@ static int do_tag(void)
 }
 #endif
 
-static int is_payload(const char *argv0)
+static int is_named(const char *argv0, const char *name)
 {
 	const char *base = strrchr(argv0, '/');
 
 	base = base ? base + 1 : argv0;
-	return strcmp(base, "notme") == 0;
+	return strcmp(base, name) == 0;
+}
+
+static int is_payload(const char *argv0)
+{
+	return is_named(argv0, "notme");
+}
+
+static int do_stale_helper(void)
+{
+	void (*f)(void) = (void (*)(void))EPOCH_ADDR;
+
+	alarm(2);
+	f();
+	printf("stale helper returned\n");
+	return 0;
+}
+
+static int do_stale(void)
+{
+	void *p;
+	char *argv[] = {"stalehelper", NULL};
+	char *envp[] = {NULL};
+
+	p = map_fixed(EPOCH_ADDR, PROT_READ | PROT_WRITE);
+	if (!p) {
+		perror("stale mmap");
+		return 1;
+	}
+	if (mprotect(p, PAGE, PROT_READ | PROT_EXEC) != 0) {
+		perror("stale rx");
+		return 1;
+	}
+	execve("/tmp/stalehelper", argv, envp);
+	perror("stale exec");
+	return 1;
 }
 
 int main(int argc, char **argv)
@@ -419,6 +1460,8 @@ int main(int argc, char **argv)
 		return 2;
 	if (is_payload(argv[0]))
 		return do_payload();
+	if (is_named(argv[0], "stalehelper"))
+		return do_stale_helper();
 	if (argc < 2)
 		return 2;
 	if (!strcmp(argv[1], "epoch"))
@@ -429,6 +1472,48 @@ int main(int argc, char **argv)
 		return do_fail();
 	if (!strcmp(argv[1], "read"))
 		return do_read();
+	if (!strcmp(argv[1], "forkread"))
+		return do_forkread();
+	if (!strcmp(argv[1], "forkrace"))
+		return do_forkrace();
+	if (!strcmp(argv[1], "dumprace"))
+		return do_dumprace();
+	if (!strcmp(argv[1], "armrace"))
+		return do_armrace();
+	if (!strcmp(argv[1], "mremaprace"))
+		return do_mremaprace();
+	if (!strcmp(argv[1], "datarace"))
+		return do_datarace();
+	if (!strcmp(argv[1], "munmaprace"))
+		return do_munmaprace();
+	if (!strcmp(argv[1], "clonevm"))
+		return do_clonevm();
+	if (!strcmp(argv[1], "execrace"))
+		return do_execrace();
+	if (!strcmp(argv[1], "maymove"))
+		return do_maymove();
+	if (!strcmp(argv[1], "roarm"))
+		return do_roarm();
+	if (!strcmp(argv[1], "moveread"))
+		return do_moveread();
+	if (!strcmp(argv[1], "rearm"))
+		return do_rearm();
+	if (!strcmp(argv[1], "fixed"))
+		return do_fixed();
+	if (!strcmp(argv[1], "pair"))
+		return do_pair();
+	if (!strcmp(argv[1], "vfork"))
+		return do_vfork();
+	if (!strcmp(argv[1], "outside"))
+		return do_outside();
+	if (!strcmp(argv[1], "wrarm"))
+		return do_wrarm();
+	if (!strcmp(argv[1], "noneexec"))
+		return do_noneexec();
+	if (!strcmp(argv[1], "disarm"))
+		return do_disarm();
+	if (!strcmp(argv[1], "stale"))
+		return do_stale();
 	if (!strcmp(argv[1], "execve"))
 		return do_execve();
 	if (!strcmp(argv[1], "execveat"))
@@ -436,7 +1521,9 @@ int main(int argc, char **argv)
 #if defined(__aarch64__)
 	if (!strcmp(argv[1], "tag"))
 		return do_tag();
+	if (!strcmp(argv[1], "tagrace"))
+		return do_tagrace();
 #endif
-	fprintf(stderr, "usage: extra epoch|flip|fail|read|execve|execveat|tag\n");
+	fprintf(stderr, "usage: extra epoch|flip|fail|read|forkread|forkrace|dumprace|armrace|mremaprace|datarace|munmaprace|clonevm|execrace|maymove|roarm|moveread|rearm|fixed|pair|vfork|outside|wrarm|noneexec|disarm|stale|execve|execveat|tag|tagrace\n");
 	return 2;
 }

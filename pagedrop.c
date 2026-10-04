@@ -97,7 +97,6 @@ static unsigned long epoch_counter;
 struct pb_tgid {
 	struct list_head list;
 	pid_t tgid;
-	int armed;
 };
 
 static LIST_HEAD(tgid_list);
@@ -114,7 +113,10 @@ struct marea {
 static unsigned long data_lo, data_hi;
 static int data_on;
 static LIST_HEAD(data_seen);
+static LIST_HEAD(data_armed);
 static DEFINE_MUTEX(pb_log_lock);
+
+static bool pb_name_matches(const char *name);
 
 #if LINUX_VERSION_CODE < KERNEL_VERSION(5, 0, 0)
 #define pb_access_ok(addr, size) access_ok(VERIFY_READ, (addr), (size))
@@ -192,7 +194,6 @@ static void pb_tgid_add(pid_t tgid)
 	if (!n)
 		return;
 	n->tgid = tgid;
-	n->armed = 0;
 	INIT_LIST_HEAD(&n->list);
 	spin_lock(&tgid_lock);
 	list_for_each_entry(t, &tgid_list, list) {
@@ -232,36 +233,6 @@ static void pb_tgid_clear(void)
 	spin_unlock(&tgid_lock);
 }
 
-static int pb_tgid_armed(pid_t tgid)
-{
-	struct pb_tgid *t;
-	int armed = 0;
-
-	spin_lock(&tgid_lock);
-	list_for_each_entry(t, &tgid_list, list) {
-		if (t->tgid == tgid) {
-			armed = t->armed;
-			break;
-		}
-	}
-	spin_unlock(&tgid_lock);
-	return armed;
-}
-
-static void pb_tgid_set_armed(pid_t tgid)
-{
-	struct pb_tgid *t;
-
-	spin_lock(&tgid_lock);
-	list_for_each_entry(t, &tgid_list, list) {
-		if (t->tgid == tgid) {
-			t->armed = 1;
-			break;
-		}
-	}
-	spin_unlock(&tgid_lock);
-}
-
 static bool pb_parent_tracked(void)
 {
 	struct task_struct *parent;
@@ -284,7 +255,7 @@ static bool pb_is_target(void)
 	tgid = current->tgid;
 	if (pb_tgid_has(tgid))
 		return true;
-	if (pb_parent_tracked() || strstr(current->comm, path)) {
+	if (pb_parent_tracked() || pb_name_matches(current->comm)) {
 		pb_tgid_add(tgid);
 		return true;
 	}
@@ -692,6 +663,71 @@ static void fh_remove_hooks(struct ftrace_hook *hooks, size_t count)
 #pragma GCC optimize("-fno-optimize-sibling-calls")
 #endif
 
+static long pb_mprotect(unsigned long addr, unsigned long len, unsigned long prot);
+
+/*
+ * Restore before forgetting, but never while holding marea_lock.
+ *
+ * pb_mprotect reaches the real mprotect, which wants mmap_write_lock, and
+ * fh_vm_mmap_pgoff already runs under that lock and takes marea_lock. Doing
+ * one inside the other is an ABBA deadlock. So: collect the pages under the
+ * lock, restore with no lock held, then drop the records.
+ *
+ * The records outlive the restore, so a reader that faults meanwhile finds
+ * one and is handled. A restore that lands on a page a reader already fixed
+ * is the same protection, so it is a no-op.
+ */
+static void pb_disarm_range(pid_t tgid, unsigned long addr, unsigned long len)
+{
+	unsigned long start;
+	unsigned long end;
+	unsigned long prot;
+	struct marea *entry, *tmp;
+	int i;
+	int n;
+
+	if (!len)
+		return;
+	start = addr & PAGE_MASK;
+	end = (addr + len + PAGE_SIZE - 1) & PAGE_MASK;
+	n = pb_page_count(len);
+	for (i = 0; i < n; i++) {
+		unsigned long page = start + (unsigned long)i * PAGE_SIZE;
+		unsigned long saved = 0;
+		bool found = false;
+
+		mutex_lock(&marea_lock);
+		list_for_each_entry(entry, &data_armed, list) {
+			if (entry->tgid != tgid || entry->addr != page)
+				continue;
+			saved = entry->prot;
+			found = true;
+			break;
+		}
+		mutex_unlock(&marea_lock);
+		if (!found)
+			continue;
+		prot = saved;
+		pb_mprotect(page, PAGE_SIZE, prot ? prot : PROT_READ);
+	}
+	mutex_lock(&marea_lock);
+	list_for_each_entry_safe(entry, tmp, &data_seen, list) {
+		if (entry->tgid != tgid || entry->addr < start || entry->addr >= end)
+			continue;
+		list_del(&entry->list);
+		kfree(entry);
+	}
+	mutex_unlock(&marea_lock);
+	mutex_lock(&marea_lock);
+	list_for_each_entry_safe(entry, tmp, &data_armed, list) {
+		if (entry->tgid != tgid || entry->addr < start || entry->addr >= end)
+			continue;
+		list_del(&entry->list);
+		kfree(entry);
+	}
+	mutex_unlock(&marea_lock);
+}
+
 static void pb_handle_protect(struct pt_regs *regs)
 {
 	unsigned long addr = pb_arg(regs, 0);
@@ -699,6 +735,7 @@ static void pb_handle_protect(struct pt_regs *regs)
 	unsigned long prot = pb_arg(regs, 2);
 	int n_pages = pb_page_count(len);
 
+	pb_disarm_range(current->tgid, addr, len);
 	if (prot_has_wx(prot)) {
 		track_pages(addr, n_pages, prot);
 		pb_set_arg(regs, 2, prot & ~PROT_WRITE);
@@ -725,7 +762,12 @@ static long pb_mprotect(unsigned long addr, unsigned long len, unsigned long pro
 	return real_sys_mprotect(&regs);
 }
 
-static bool pb_can_arm(unsigned long addr)
+/*
+ * True when the access that faulted is already legal, which means a racing
+ * thread restored or remapped the page while this fault was in flight. The
+ * fault must then be swallowed, not turned into a signal.
+ */
+static bool pb_page_satisfies(unsigned long addr, bool want_write)
 {
 	struct vm_area_struct *vma;
 	bool ok = false;
@@ -735,34 +777,191 @@ static bool pb_can_arm(unsigned long addr)
 	if (mmap_read_lock_killable(current->mm))
 		return false;
 	vma = find_vma(current->mm, addr);
-	if (vma && vma->vm_start <= addr && !(vma->vm_flags & VM_EXEC))
+	if (vma && vma->vm_start <= addr &&
+	    (vma->vm_flags & (want_write ? VM_WRITE : VM_READ)))
 		ok = true;
 	mmap_read_unlock(current->mm);
 	return ok;
 }
 
-static int pb_arm_range(void)
+static bool pb_can_arm(unsigned long addr, unsigned long *prot_out)
+{
+	struct vm_area_struct *vma;
+	bool ok = false;
+
+	if (!current->mm)
+		return false;
+	if (mmap_read_lock_killable(current->mm))
+		return false;
+	vma = find_vma(current->mm, addr);
+	if (vma && vma->vm_start <= addr && !(vma->vm_flags & VM_EXEC)) {
+		unsigned long prot = 0;
+
+		if (vma->vm_flags & VM_READ)
+			prot |= PROT_READ;
+		if (vma->vm_flags & VM_WRITE)
+			prot |= PROT_WRITE;
+		if (prot) {
+			*prot_out = prot;
+			ok = true;
+		}
+	}
+	mmap_read_unlock(current->mm);
+	return ok;
+}
+
+static void pb_drop_tgid_list(struct list_head *head, pid_t tgid)
+{
+	struct marea *entry, *tmp;
+
+	list_for_each_entry_safe(entry, tmp, head, list) {
+		if (entry->tgid != tgid)
+			continue;
+		list_del(&entry->list);
+		kfree(entry);
+	}
+}
+
+static void pb_drop_data_state(pid_t tgid)
+{
+	mutex_lock(&marea_lock);
+	pb_drop_tgid_list(&data_seen, tgid);
+	pb_drop_tgid_list(&data_armed, tgid);
+	mutex_unlock(&marea_lock);
+}
+
+static void pb_drop_marea(pid_t tgid)
+{
+	mutex_lock(&marea_lock);
+	pb_drop_tgid_list(&marea_list, tgid);
+	mutex_unlock(&marea_lock);
+}
+
+static void pb_drop_user_range(pid_t tgid, unsigned long addr, unsigned long len)
+{
+	struct marea *entry, *tmp;
+	unsigned long start;
+	unsigned long end;
+
+	if (!len)
+		return;
+	start = addr & PAGE_MASK;
+	end = (addr + len + PAGE_SIZE - 1) & PAGE_MASK;
+	if (end < start)
+		end = ~0UL;
+	mutex_lock(&marea_lock);
+	list_for_each_entry_safe(entry, tmp, &data_armed, list) {
+		if (entry->tgid != tgid || entry->addr < start || entry->addr >= end)
+			continue;
+		list_del(&entry->list);
+		kfree(entry);
+	}
+	list_for_each_entry_safe(entry, tmp, &data_seen, list) {
+		if (entry->tgid != tgid || entry->addr < start || entry->addr >= end)
+			continue;
+		list_del(&entry->list);
+		kfree(entry);
+	}
+	list_for_each_entry_safe(entry, tmp, &marea_list, list) {
+		if (entry->tgid != tgid || entry->addr < start || entry->addr >= end)
+			continue;
+		list_del(&entry->list);
+		kfree(entry);
+	}
+	mutex_unlock(&marea_lock);
+}
+
+static bool pb_armed_claim(pid_t tgid, unsigned long page, unsigned long prot)
+{
+	struct marea *seen;
+
+	mutex_lock(&marea_lock);
+	list_for_each_entry(seen, &data_armed, list) {
+		if (seen->tgid == tgid && seen->addr == page) {
+			mutex_unlock(&marea_lock);
+			return false;
+		}
+	}
+	seen = new_marea(tgid, page, prot);
+	if (seen)
+		list_add(&seen->list, &data_armed);
+	mutex_unlock(&marea_lock);
+	return seen != NULL;
+}
+
+static void pb_armed_unclaim(pid_t tgid, unsigned long page)
+{
+	struct marea *seen, *tmp;
+
+	mutex_lock(&marea_lock);
+	list_for_each_entry_safe(seen, tmp, &data_armed, list) {
+		if (seen->tgid != tgid || seen->addr != page)
+			continue;
+		list_del(&seen->list);
+		kfree(seen);
+		break;
+	}
+	mutex_unlock(&marea_lock);
+}
+
+static void pb_arm_range(void)
 {
 	unsigned long addr;
-	int n = 0;
+	pid_t tgid = current->tgid;
 
 	if (!data_on || data_hi <= data_lo)
-		return 0;
+		return;
 	for (addr = data_lo; addr < data_hi; addr += PAGE_SIZE) {
-		if (!pb_can_arm(addr))
+		unsigned long prot = 0;
+
+		if (!pb_can_arm(addr, &prot))
 			continue;
-		if (pb_mprotect(addr, PAGE_SIZE, PROT_NONE) == 0)
-			n++;
+		/*
+		 * Record before PROT_NONE. The other way round leaves a
+		 * window where the page faults but no record exists, and
+		 * the reader then takes a real SIGSEGV.
+		 */
+		if (!pb_armed_claim(tgid, addr, prot))
+			continue;
+		if (pb_mprotect(addr, PAGE_SIZE, PROT_NONE))
+			pb_armed_unclaim(tgid, addr);
 	}
-	return n;
 }
 
 static void pb_try_arm(void)
 {
-	if (!data_on || pb_tgid_armed(current->tgid))
+	if (!data_on)
 		return;
-	if (pb_arm_range() > 0)
-		pb_tgid_set_armed(current->tgid);
+	pb_arm_range();
+}
+
+static void pb_read_armed(unsigned long addr, unsigned long len)
+{
+	int n_pages = pb_page_count(len);
+	int i;
+
+	addr &= PAGE_MASK;
+	for (i = 0; i < n_pages; i++) {
+		unsigned long page = addr + (unsigned long)i * PAGE_SIZE;
+		struct marea *seen;
+		unsigned long prot = 0;
+		bool armed = false;
+
+		mutex_lock(&marea_lock);
+		list_for_each_entry(seen, &data_armed, list) {
+			if (seen->tgid != current->tgid || seen->addr != page)
+				continue;
+			prot = seen->prot;
+			armed = true;
+			break;
+		}
+		mutex_unlock(&marea_lock);
+		if (!armed)
+			continue;
+		if (!(prot & PROT_READ))
+			prot |= PROT_READ;
+		pb_mprotect(page, PAGE_SIZE, prot);
+	}
 }
 
 static asmlinkage long fh_sys_mprotect(struct pt_regs *regs)
@@ -772,6 +971,8 @@ static asmlinkage long fh_sys_mprotect(struct pt_regs *regs)
 	if (!pb_is_target())
 		return real_sys_mprotect(regs);
 	prot = pb_arg(regs, 2);
+	if (prot & PROT_EXEC)
+		pb_read_armed(pb_arg(regs, 0), pb_arg(regs, 1));
 	pb_handle_protect(regs);
 	if (prot_has_x_only(prot) || prot_has_wx(prot))
 		pb_try_arm();
@@ -787,6 +988,8 @@ static asmlinkage long fh_sys_pkey_mprotect(struct pt_regs *regs)
 	if (!pb_is_target())
 		return real_sys_pkey_mprotect(regs);
 	prot = pb_arg(regs, 2);
+	if (prot & PROT_EXEC)
+		pb_read_armed(pb_arg(regs, 0), pb_arg(regs, 1));
 	pb_handle_protect(regs);
 	if (prot_has_x_only(prot) || prot_has_wx(prot))
 		pb_try_arm();
@@ -809,8 +1012,88 @@ static bool pb_page_exec(unsigned long addr)
 	return exec;
 }
 
+static bool pb_relocate_locked(pid_t tgid, unsigned long from, unsigned long to)
+{
+	struct marea *entry;
+
+	list_for_each_entry(entry, &data_armed, list) {
+		if (entry->tgid != tgid || entry->addr != from)
+			continue;
+		entry->addr = to;
+		return true;
+	}
+	return false;
+}
+
+static bool pb_relocate_armed(pid_t tgid, unsigned long from, unsigned long to)
+{
+	bool moved;
+
+	mutex_lock(&marea_lock);
+	moved = pb_relocate_locked(tgid, from, to);
+	mutex_unlock(&marea_lock);
+	return moved;
+}
+
+/*
+ * Settle one armed page after the kernel has moved it. When the record was
+ * relocated ahead of the move, it already sits at the destination and must
+ * only be settled there. Otherwise it is still at the source and has to
+ * follow. A page that lands outside the armed range gets its protection
+ * back, otherwise nothing would ever restore it.
+ */
+static void pb_armed_after_move(unsigned long from, unsigned long to, int keep, bool pre)
+{
+	struct marea *entry, *tmp;
+	unsigned long prot = 0;
+	pid_t tgid = current->tgid;
+	unsigned long want = pre ? to : from;
+	bool found = false;
+	bool in_range = to >= data_lo && to < data_hi;
+
+	mutex_lock(&marea_lock);
+	list_for_each_entry_safe(entry, tmp, &data_armed, list) {
+		if (entry->tgid != tgid || entry->addr != want)
+			continue;
+		found = true;
+		prot = entry->prot;
+		break;
+	}
+	mutex_unlock(&marea_lock);
+	/*
+	 * Restore before forgetting, and outside the lock for the same reason
+	 * as pb_disarm_range: pb_mprotect wants mmap_write_lock, which the
+	 * mmap hook already holds while taking marea_lock.
+	 */
+	if (found && keep && !in_range) {
+		if (pb_mprotect(to, PAGE_SIZE, prot ? prot : PROT_READ))
+			pr_warn("restore %lx prot=%lx failed\n", to, prot);
+	}
+	mutex_lock(&marea_lock);
+	list_for_each_entry_safe(entry, tmp, &data_armed, list) {
+		if (entry->tgid != tgid || entry->addr != want)
+			continue;
+		if (keep && in_range)
+			entry->addr = to;
+		else {
+			list_del(&entry->list);
+			kfree(entry);
+		}
+		break;
+	}
+	list_for_each_entry_safe(entry, tmp, &data_seen, list) {
+		if (entry->tgid != tgid || entry->addr != from)
+			continue;
+		list_del(&entry->list);
+		kfree(entry);
+	}
+	mutex_unlock(&marea_lock);
+	if (found && keep && !in_range)
+		pb_mprotect(to, PAGE_SIZE, prot ? prot : PROT_READ);
+}
+
 static void pb_note_mremap(unsigned long old, unsigned long old_len,
-			   unsigned long new, unsigned long new_len)
+			   unsigned long new, unsigned long new_len, bool pre)
 {
 	unsigned long old_pages = pb_page_count(old_len);
 	unsigned long new_pages = pb_page_count(new_len);
@@ -821,11 +1104,13 @@ static void pb_note_mremap(unsigned long old, unsigned long old_len,
 	for (i = 0; i < old_pages; i++) {
 		struct marea *entry;
 		unsigned long from = old + i * PAGE_SIZE;
+		int keep = i < new_pages;
 
+		pb_armed_after_move(from, new + i * PAGE_SIZE, keep, pre);
 		mutex_lock(&marea_lock);
 		entry = search_page(current->tgid, from);
 		if (entry) {
-			if (i < new_pages)
+			if (keep)
 				entry->addr = new + i * PAGE_SIZE;
 			else {
 				list_del(&entry->list);
@@ -833,26 +1118,124 @@ static void pb_note_mremap(unsigned long old, unsigned long old_len,
 			}
 		}
 		mutex_unlock(&marea_lock);
-		if (i < new_pages && pb_page_exec(new + i * PAGE_SIZE))
+		if (keep && pb_page_exec(new + i * PAGE_SIZE))
 			dump_to_file(new + i * PAGE_SIZE, PAGE_SIZE, "mremap", NULL);
 	}
 }
 
 static asmlinkage long (*real_sys_mremap)(struct pt_regs *regs);
 
+/*
+ * Restore one armed page to the protection we recorded and forget it. The
+ * restore happens first, so the page is never inaccessible without a record.
+ */
+static void pb_release_armed(pid_t tgid, unsigned long page)
+{
+	struct marea *entry, *tmp;
+	unsigned long prot = 0;
+	bool found = false;
+
+	mutex_lock(&marea_lock);
+	list_for_each_entry(entry, &data_armed, list) {
+		if (entry->tgid != tgid || entry->addr != page)
+			continue;
+		prot = entry->prot;
+		found = true;
+		break;
+	}
+	mutex_unlock(&marea_lock);
+	/* Restore outside the lock, same reason as pb_disarm_range. */
+	if (found)
+		pb_mprotect(page, PAGE_SIZE, prot ? prot : PROT_READ);
+	mutex_lock(&marea_lock);
+	list_for_each_entry_safe(entry, tmp, &data_armed, list) {
+		if (entry->tgid != tgid || entry->addr != page)
+			continue;
+		list_del(&entry->list);
+		kfree(entry);
+		break;
+	}
+	list_for_each_entry_safe(entry, tmp, &data_seen, list) {
+		if (entry->tgid != tgid || entry->addr != page)
+			continue;
+		list_del(&entry->list);
+		kfree(entry);
+	}
+	mutex_unlock(&marea_lock);
+	(void)found;
+}
+
 static asmlinkage long fh_sys_mremap(struct pt_regs *regs)
 {
 	unsigned long old = pb_arg(regs, 0);
 	unsigned long old_len = pb_arg(regs, 1);
 	unsigned long new_len = pb_arg(regs, 2);
+	unsigned long flags = pb_arg(regs, 3);
+	unsigned long new_addr = pb_arg(regs, 4);
+	pid_t tgid = current->tgid;
+	int n_pages = pb_page_count(old_len);
+	int moved = 0;
+	bool pre = false;
+	int i;
 	long ret;
 
 	if (!pb_is_target())
 		return real_sys_mremap(regs);
+	/*
+	 * MREMAP_FIXED names the destination now, so settle each page before
+	 * the kernel moves it. A page that lands outside the armed range is
+	 * made accessible first: nothing would restore it once it is there,
+	 * and a reader would take a signal this module caused. A page that
+	 * stays in range keeps its record, relocated ahead of the move.
+	 */
+	if (flags & MREMAP_FIXED) {
+		for (i = 0; i < n_pages; i++) {
+			unsigned long to = new_addr + (unsigned long)i * PAGE_SIZE;
+			unsigned long from = old + (unsigned long)i * PAGE_SIZE;
+
+			if (to >= data_lo && to < data_hi)
+				moved += pb_relocate_armed(tgid, from, to);
+			else
+				pb_release_armed(tgid, from);
+		}
+		pre = moved > 0;
+	} else if (old_len != new_len) {
+		/*
+		 * Without MREMAP_FIXED the kernel picks the destination, so
+		 * no record can be placed ahead of the move. Measured on
+		 * 6.8, a same-size move keeps the address and there is no
+		 * window; a size change can relocate, so release the pages
+		 * first and let them arrive accessible. The cost is that a
+		 * relocated page is not re-armed until the next mprotect.
+		 */
+		for (i = 0; i < n_pages; i++)
+			pb_release_armed(tgid, old + (unsigned long)i * PAGE_SIZE);
+	}
 	ret = real_sys_mremap(regs);
-	if (ret < 0)
+	if (ret < 0) {
+		if (pre)
+			for (i = 0; i < n_pages; i++)
+				pb_relocate_armed(tgid, new_addr + (unsigned long)i * PAGE_SIZE,
+						  old + (unsigned long)i * PAGE_SIZE);
 		return ret;
-	pb_note_mremap(old, old_len, (unsigned long)ret, new_len);
+	}
+	pb_note_mremap(old, old_len, (unsigned long)ret, new_len, pre);
+	return ret;
+}
+
+static asmlinkage long (*real_sys_munmap)(struct pt_regs *regs);
+
+static asmlinkage long fh_sys_munmap(struct pt_regs *regs)
+{
+	unsigned long addr = pb_arg(regs, 0);
+	unsigned long len = pb_arg(regs, 1);
+	long ret;
+
+	if (!pb_is_target())
+		return real_sys_munmap(regs);
+	ret = real_sys_munmap(regs);
+	if (!ret)
+		pb_drop_user_range(current->tgid, addr, len);
 	return ret;
 }
 
@@ -887,6 +1270,7 @@ static asmlinkage unsigned long fh_vm_mmap_pgoff(struct file *file,
 	ret = real_vm_mmap_pgoff(file, addr, len, prot, flag, pgoff);
 	if (IS_ERR_VALUE(ret))
 		return ret;
+	pb_drop_user_range(current->tgid, ret, (unsigned long)n_pages * PAGE_SIZE);
 
 	if (prot_has_x_only(prot)) {
 		int i;
@@ -945,13 +1329,26 @@ static unsigned long pb_fault_ip(void)
 	return ip;
 }
 
-static bool pb_ip_tracked(unsigned long ip, unsigned long *epoch)
+static pid_t pb_parent_tgid(void)
+{
+	struct task_struct *parent;
+	pid_t tgid = 0;
+
+	rcu_read_lock();
+	parent = rcu_dereference(current->real_parent);
+	if (parent)
+		tgid = parent->tgid;
+	rcu_read_unlock();
+	return tgid;
+}
+
+static bool pb_ip_tracked_for(pid_t tgid, unsigned long ip, unsigned long *epoch)
 {
 	struct marea *page;
 	bool found = false;
 
 	mutex_lock(&marea_lock);
-	page = search_page(current->tgid, ip);
+	page = search_page(tgid, ip);
 	if (page && (page->prot & PROT_EXEC)) {
 		*epoch = page->epoch;
 		found = true;
@@ -960,15 +1357,22 @@ static bool pb_ip_tracked(unsigned long ip, unsigned long *epoch)
 	return found;
 }
 
-static bool pb_data_seen(pid_t tgid, unsigned long page, unsigned long handler_epoch)
+static bool pb_ip_tracked(unsigned long ip, unsigned long *epoch)
+{
+	if (pb_ip_tracked_for(current->tgid, ip, epoch))
+		return true;
+	return pb_ip_tracked_for(pb_parent_tgid(), ip, epoch);
+}
+
+static bool pb_armed_prot_for(pid_t tgid, unsigned long page, unsigned long *prot_out)
 {
 	struct marea *seen;
 	bool found = false;
 
 	mutex_lock(&marea_lock);
-	list_for_each_entry(seen, &data_seen, list) {
-		if (seen->tgid == tgid && seen->addr == page &&
-		    seen->epoch == handler_epoch) {
+	list_for_each_entry(seen, &data_armed, list) {
+		if (seen->tgid == tgid && seen->addr == page) {
+			*prot_out = seen->prot;
 			found = true;
 			break;
 		}
@@ -977,16 +1381,40 @@ static bool pb_data_seen(pid_t tgid, unsigned long page, unsigned long handler_e
 	return found;
 }
 
-static void pb_data_mark(pid_t tgid, unsigned long page, unsigned long handler_epoch)
+static bool pb_data_claim(pid_t tgid, unsigned long page, unsigned long handler_epoch)
 {
 	struct marea *seen;
 
-	seen = new_marea(tgid, page, 0);
-	if (!seen)
-		return;
-	seen->epoch = handler_epoch;
 	mutex_lock(&marea_lock);
-	list_add(&seen->list, &data_seen);
+	list_for_each_entry(seen, &data_seen, list) {
+		if (seen->tgid == tgid && seen->addr == page &&
+		    seen->epoch == handler_epoch) {
+			mutex_unlock(&marea_lock);
+			return false;
+		}
+	}
+	seen = new_marea(tgid, page, 0);
+	if (seen) {
+		seen->epoch = handler_epoch;
+		list_add(&seen->list, &data_seen);
+	}
+	mutex_unlock(&marea_lock);
+	return seen != NULL;
+}
+
+static void pb_data_unclaim(pid_t tgid, unsigned long page, unsigned long handler_epoch)
+{
+	struct marea *seen, *tmp;
+
+	mutex_lock(&marea_lock);
+	list_for_each_entry_safe(seen, tmp, &data_seen, list) {
+		if (seen->tgid != tgid || seen->addr != page ||
+		    seen->epoch != handler_epoch)
+			continue;
+		list_del(&seen->list);
+		kfree(seen);
+		break;
+	}
 	mutex_unlock(&marea_lock);
 }
 
@@ -1003,30 +1431,53 @@ static int pb_handle_data(unsigned long address)
 	unsigned long ip = pb_fault_ip();
 	unsigned long page = address & PAGE_MASK;
 	unsigned long handler_epoch = 0;
-	unsigned long ep = 0;
+	unsigned long restore = 0;
 	pid_t tgid = current->tgid;
+	pid_t parent;
 	struct pt_regs *regs;
+	bool tracked;
+	bool armed;
 
-	if (page < data_lo || page >= data_hi)
+	/*
+	 * The record, not the range, decides ownership. An mremap can carry
+	 * a page we made inaccessible out of the range, and only a record for
+	 * it says so.
+	 */
+	armed = pb_armed_prot_for(tgid, page, &restore);
+	parent = pb_parent_tgid();
+	if (!armed && parent > 0 && parent != tgid)
+		armed = pb_armed_prot_for(parent, page, &restore);
+	if (!armed || !restore) {
+		/*
+		 * Nothing of ours covers this page. If the access is already
+		 * legal then a racing thread restored, moved or replaced it,
+		 * and the fault is stale: swallow it. Otherwise it is a real
+		 * fault, ours or the program's, and the signal stands.
+		 */
+		if (pb_page_satisfies(page, pb_fault_is_write()))
+			return 1;
 		return 0;
-	if (!pb_ip_tracked(ip, &handler_epoch))
+	}
+	tracked = pb_ip_tracked(ip, &handler_epoch);
+	if (pb_fault_is_write() && !(restore & PROT_WRITE))
 		return 0;
 	regs = kzalloc(sizeof(*regs), GFP_KERNEL);
 	if (!regs)
 		return 0;
 	pb_set_arg(regs, 0, page);
 	pb_set_arg(regs, 1, PAGE_SIZE);
-	pb_set_arg(regs, 2, PROT_READ | PROT_WRITE);
+	pb_set_arg(regs, 2, restore);
 	if (real_sys_mprotect(regs)) {
 		kfree(regs);
 		return 0;
 	}
 	kfree(regs);
-	if (!pb_data_seen(tgid, page, handler_epoch)) {
-		if (dump_to_file(page, PAGE_SIZE, "read", &ep) == 0)
-			pb_data_mark(tgid, page, handler_epoch);
+	if (tracked && pb_data_claim(tgid, page, handler_epoch)) {
+		if (dump_to_file(page, PAGE_SIZE, "read", NULL) == 0)
+			pb_trace_line(ip, page, handler_epoch);
+		else
+			pb_data_unclaim(tgid, page, handler_epoch);
 	}
-	pb_trace_line(ip, page, ep);
 	return 1;
 }
 
@@ -1056,7 +1507,8 @@ static asmlinkage int fh_force_sig_fault(int sig, int code, void __user *addr)
 	if (!pb_is_target() || sig != SIGSEGV)
 		return real_force_sig_fault(sig, code, addr);
 
-	if (data_on && pb_fault_is_read() && pb_handle_data(address))
+	if (data_on && (pb_fault_is_read() || pb_fault_is_write()) &&
+	    pb_handle_data(address))
 		return 0;
 
 	if (!pb_take_page(address, &page_addr, &new_prot))
@@ -1072,7 +1524,10 @@ static asmlinkage int fh_force_sig_fault(int sig, int code, void __user *addr)
 	if (pb_fault_is_write()) {
 		new_prot &= ~PROT_EXEC;
 		pb_set_arg(regs, 2, new_prot);
-		real_sys_mprotect(regs);
+		if (real_sys_mprotect(regs)) {
+			kfree(regs);
+			return real_force_sig_fault(sig, code, addr);
+		}
 		kfree(regs);
 		return 0;
 	}
@@ -1082,7 +1537,10 @@ static asmlinkage int fh_force_sig_fault(int sig, int code, void __user *addr)
 		pb_try_arm();
 		new_prot &= ~PROT_WRITE;
 		pb_set_arg(regs, 2, new_prot);
-		real_sys_mprotect(regs);
+		if (real_sys_mprotect(regs)) {
+			kfree(regs);
+			return real_force_sig_fault(sig, code, addr);
+		}
 		kfree(regs);
 		return 0;
 	}
@@ -1188,17 +1646,25 @@ static long pb_finish_exec(struct list_head *saved, bool matched, long ret)
 static long pb_do_exec(bool matched, long (*real)(struct pt_regs *), struct pt_regs *regs)
 {
 	bool added = false;
+	bool tracked;
 	long ret;
+	pid_t tgid = current->tgid;
 	LIST_HEAD(saved);
 
+	tracked = pb_tgid_has(tgid);
 	if (matched) {
-		added = !pb_tgid_has(current->tgid);
-		pb_tgid_add(current->tgid);
+		added = !tracked;
+		pb_tgid_add(tgid);
 		pb_move_tracked(&saved);
 	}
 	ret = real(regs);
+	if (ret == 0 && (matched || tracked)) {
+		pb_drop_data_state(tgid);
+		if (!matched)
+			pb_drop_marea(tgid);
+	}
 	if (matched && ret != 0 && added)
-		pb_tgid_del(current->tgid);
+		pb_tgid_del(tgid);
 	return pb_finish_exec(&saved, matched, ret);
 }
 
@@ -1226,13 +1692,73 @@ static asmlinkage long fh_sys_execveat(struct pt_regs *regs)
 	return pb_do_exec(matched, real_sys_execveat, regs);
 }
 
+static void pb_copy_list(struct list_head *head, pid_t from, pid_t to)
+{
+	struct marea *entry, *fresh;
+	LIST_HEAD(add);
+
+	list_for_each_entry(entry, head, list) {
+		if (entry->tgid != from)
+			continue;
+		fresh = new_marea(to, entry->addr, entry->prot);
+		if (!fresh)
+			continue;
+		fresh->epoch = entry->epoch;
+		list_add(&fresh->list, &add);
+	}
+	list_splice(&add, head);
+}
+
+static void pb_copy_tracking(pid_t from, pid_t to)
+{
+	mutex_lock(&marea_lock);
+	pb_copy_list(&data_armed, from, to);
+	pb_copy_list(&marea_list, from, to);
+	mutex_unlock(&marea_lock);
+}
+
+static bool pb_child_alive(long child)
+{
+	struct pid *pid;
+	struct task_struct *task;
+	bool alive = false;
+
+	pid = find_vpid((pid_t)child);
+	if (!pid)
+		return false;
+	task = get_pid_task(pid, PIDTYPE_PID);
+	if (!task)
+		return false;
+	alive = !(task->flags & PF_EXITING) && task->exit_state == 0;
+	put_task_struct(task);
+	return alive;
+}
+
+static void pb_drop_child(pid_t tgid)
+{
+	pb_drop_data_state(tgid);
+	pb_drop_marea(tgid);
+	pb_tgid_del(tgid);
+}
+
 static void pb_note_child(long child, unsigned long flags, bool has_flags)
 {
 	if (child <= 0 || !pb_tgid_has(current->tgid))
 		return;
 	if (has_flags && (flags & CLONE_THREAD))
 		return;
+	/*
+	 * The child runs as soon as the fork returns, and it can exit
+	 * before this bookkeeping. Registering a tgid that is already gone
+	 * would leave its records behind for whoever reuses that pid, so
+	 * check first, and drop again if the child died while copying.
+	 */
+	if (!pb_child_alive(child))
+		return;
 	pb_tgid_add((pid_t)child);
+	pb_copy_tracking(current->tgid, (pid_t)child);
+	if (!pb_child_alive(child))
+		pb_drop_child((pid_t)child);
 }
 
 static asmlinkage long (*real_sys_fork)(struct pt_regs *regs);
@@ -1280,8 +1806,11 @@ static void (*real_do_exit)(long code);
 
 static void fh_do_exit(long code)
 {
-	if (current->signal && atomic_read(&current->signal->live) <= 1)
+	if (current->signal && atomic_read(&current->signal->live) <= 1) {
+		pb_drop_data_state(current->tgid);
+		pb_drop_marea(current->tgid);
 		pb_tgid_del(current->tgid);
+	}
 	real_do_exit(code);
 	BUG();
 }
@@ -1313,6 +1842,7 @@ static struct ftrace_hook demo_hooks[] = {
 	HOOK("sys_mprotect", fh_sys_mprotect, &real_sys_mprotect),
 	HOOK("sys_pkey_mprotect", fh_sys_pkey_mprotect, &real_sys_pkey_mprotect),
 	HOOK("sys_mremap", fh_sys_mremap, &real_sys_mremap),
+	HOOK("sys_munmap", fh_sys_munmap, &real_sys_munmap),
 	HOOK_NOSYS("vm_mmap_pgoff", fh_vm_mmap_pgoff, &real_vm_mmap_pgoff),
 	HOOK("sys_execve", fh_sys_execve, &real_sys_execve),
 	HOOK("sys_execveat", fh_sys_execveat, &real_sys_execveat),
@@ -1356,6 +1886,7 @@ static struct pb_arm_hook arm_hooks[] = {
 	{ SYSCALL_NAME("sys_mprotect"), fh_sys_mprotect, &real_sys_mprotect },
 	{ SYSCALL_NAME("sys_pkey_mprotect"), fh_sys_pkey_mprotect, &real_sys_pkey_mprotect },
 	{ SYSCALL_NAME("sys_mremap"), fh_sys_mremap, &real_sys_mremap },
+	{ SYSCALL_NAME("sys_munmap"), fh_sys_munmap, &real_sys_munmap },
 	{ "vm_mmap_pgoff", fh_vm_mmap_pgoff, &real_vm_mmap_pgoff },
 	{ SYSCALL_NAME("sys_execve"), fh_sys_execve, &real_sys_execve },
 	{ SYSCALL_NAME("sys_execveat"), fh_sys_execveat, &real_sys_execveat },
@@ -1445,6 +1976,7 @@ static void fh_exit(void)
 	clear_tracked();
 	mutex_lock(&marea_lock);
 	pb_free_list(&data_seen);
+	pb_free_list(&data_armed);
 	mutex_unlock(&marea_lock);
 	pb_tgid_clear();
 	pr_info("unloaded\n");

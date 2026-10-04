@@ -91,7 +91,7 @@ A plain C program, packed with UPX and with the VMProtect demo, is compared in [
 
 | Use case | x86_64 | arm64 |
 |---|---|---|
-| 12 hooks install, clean `rmmod` | pass | pass |
+| 13 hooks install, clean `rmmod` | pass | pass |
 | ELF `.text` live-matches the dump | pass | pass |
 | RWX write fault, then exec fault dumps the page | pass | pass |
 | `prctl` rename still tracked | pass | pass |
@@ -105,6 +105,23 @@ A plain C program, packed with UPX and with the VMProtect demo, is compared in [
 | `execve` / `execveat` of a matching path starts tracking | pass | pass |
 | Exec, drop exec, exec again; second dump is the new bytes | pass | pass |
 | Tagged fault address dumps the untagged page | n/a | pass |
+| Index line records tgid, comm, va, epoch, why | pass | pass |
+| Two matching processes do not drop each other | pass | pass |
+| `vfork` then `exec` of `/bin/true` | pass | pass |
+| Read outside `data=` is not traced | pass | pass |
+| `MAP_FIXED` over an armed page is traced again | pass | pass |
+| Bad `data=` is rejected | pass | pass |
+| 8 threads, one dump and one trace line | pass | pass |
+| Reader racing a re-arm loop, no signal | pass | pass |
+| 200 fork-and-fault children survive | pass | pass |
+| Reader racing `mremap` of armed pages | pass | pass |
+| `mprotect` storm over the data range, no signal | pass | pass |
+| `munmap` of an armed page against a reader | pass | pass |
+| Two threads of one tgid over one armed page | pass | pass |
+| Exec with readers in flight | pass | pass |
+| `pb_rank` over a threaded multi-process capture | pass | pass |
+| 200 forks against a reader on the armed page | pass | pass |
+| 4 threads reading through tagged pointers | n/a | pass |
 
 **Note**: Please consider using a **virtual machine** (VirtualBox, VMWare, QEMU, etc.) for testing. The module could be harmful. Avoid killing your machine or production environment by accident.
 

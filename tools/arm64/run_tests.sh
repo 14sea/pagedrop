@@ -32,10 +32,10 @@ mark $? pb_rank
 say "hooks"
 sudo rm -f /tmp/[0-9a-f]*_[0-9]*
 sudo insmod ./pagedrop.ko path=simple
-hooks=$(sudo dmesg | grep 'pagedrop: hooked' | tail -12)
-echo "$hooks"
-missing=0
-for n in mprotect pkey_mprotect mremap vm_mmap_pgoff execve execveat fork vfork clone clone3 do_exit force_sig_fault; do
+hooks=$(sudo dmesg | grep 'pagedrop: hooked' | tail -13)
+	echo "$hooks"
+	missing=0
+	for n in mprotect pkey_mprotect mremap munmap vm_mmap_pgoff execve execveat fork vfork clone clone3 do_exit force_sig_fault; do
 	echo "$hooks" | grep -q "$n" || { echo "missing hook $n"; missing=1; }
 done
 mark "$missing" "hooks"
@@ -94,6 +94,21 @@ sudo insmod ./pagedrop.ko path=extra
 ./userland/c/extra epoch
 mark "$?" "epoch"
 
+say "exact"
+sudo rmmod pagedrop 2>/dev/null || true
+sudo rm -f /tmp/[0-9a-f]*_[0-9]*
+sudo insmod ./pagedrop.ko path=extr exact=1
+./userland/c/extra epoch
+if [ $? -eq 0 ]; then
+	mark 1 "exact"
+else
+	sudo rmmod pagedrop 2>/dev/null || true
+	sudo rm -f /tmp/[0-9a-f]*_[0-9]*
+	sudo insmod ./pagedrop.ko path=extra exact=1
+	./userland/c/extra epoch
+	mark $? "exact"
+fi
+
 say "flip"
 sudo rmmod pagedrop 2>/dev/null || true
 sudo rm -f /tmp/[0-9a-f]*_[0-9]*
@@ -107,6 +122,203 @@ sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
 sudo insmod ./pagedrop.ko path=extra data=260000000-260001000
 ./userland/c/extra read
 mark "$?" "read"
+python3 - << 'PY'
+ok = False
+for line in open("/tmp/pagedrop.index"):
+    p = line.split()
+    if len(p) == 5 and p[1] == "extra" and p[2] == "260000000" and p[4] == "read":
+        int(p[0])
+        int(p[3])
+        ok = True
+        break
+raise SystemExit(0 if ok else 1)
+PY
+mark "$?" "index read"
+
+say "forkread"
+sudo rmmod pagedrop 2>/dev/null || true
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+sudo insmod ./pagedrop.ko path=extra data=260000000-260001000
+./userland/c/extra forkread
+mark "$?" "forkread"
+
+say "forkrace"
+sudo rmmod pagedrop 2>/dev/null || true
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+sudo insmod ./pagedrop.ko path=extra data=260000000-260001000
+./userland/c/extra forkrace
+mark "$?" "forkrace"
+
+say "dumprace"
+sudo rmmod pagedrop 2>/dev/null || true
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+sudo insmod ./pagedrop.ko path=extra data=260000000-260001000
+./userland/c/extra dumprace
+mark "$?" "dumprace"
+
+say "armrace"
+sudo rmmod pagedrop 2>/dev/null || true
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+sudo insmod ./pagedrop.ko path=extra data=260000000-260001000
+./userland/c/extra armrace
+mark "$?" "armrace"
+
+say "mremaprace"
+sudo rmmod pagedrop 2>/dev/null || true
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+sudo insmod ./pagedrop.ko path=extra data=260000000-260010000
+./userland/c/extra mremaprace
+mark "$?" "mremaprace"
+
+say "datarace"
+sudo rmmod pagedrop 2>/dev/null || true
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+sudo insmod ./pagedrop.ko path=extra data=260000000-260001000
+./userland/c/extra datarace
+mark "$?" "datarace"
+
+say "munmaprace"
+sudo rmmod pagedrop 2>/dev/null || true
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+sudo insmod ./pagedrop.ko path=extra data=260000000-260001000
+./userland/c/extra munmaprace
+mark "$?" "munmaprace"
+
+say "clonevm"
+sudo rmmod pagedrop 2>/dev/null || true
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+sudo insmod ./pagedrop.ko path=extra data=260000000-260001000
+./userland/c/extra clonevm
+mark "$?" "clonevm"
+
+say "maymove"
+sudo rmmod pagedrop 2>/dev/null || true
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+sudo insmod ./pagedrop.ko path=extra data=260000000-260010000
+./userland/c/extra maymove
+mark "$?" "maymove"
+
+say "execrace"
+sudo rmmod pagedrop 2>/dev/null || true
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+cp -f userland/c/extra /tmp/stalehelper
+sudo insmod ./pagedrop.ko path=extra data=260000000-260001000
+./userland/c/extra execrace
+if [ $? -eq 139 ]; then
+	mark 0 "execrace"
+else
+	mark 1 "execrace"
+fi
+
+say "rankload"
+sudo rmmod pagedrop 2>/dev/null || true
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+sudo insmod ./pagedrop.ko path=capture
+./userland/c/capture
+capture_rc=$?
+./userland/c/extra datarace
+python3 tools/pb_rank.py --file ./userland/c/extra --tgid "$(awk 'NR==1{print $1}' /tmp/pagedrop.index)" --top 5
+mark "$?" "rankload"
+mark "$capture_rc" "rankload capture"
+
+
+say "roarm"
+sudo rmmod pagedrop 2>/dev/null || true
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+sudo insmod ./pagedrop.ko path=extra data=260000000-260001000
+./userland/c/extra roarm
+mark "$?" "roarm"
+
+say "moveread"
+sudo rmmod pagedrop 2>/dev/null || true
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+sudo insmod ./pagedrop.ko path=extra data=260000000-260001000
+./userland/c/extra moveread
+mark "$?" "moveread"
+
+say "movein"
+sudo rmmod pagedrop 2>/dev/null || true
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+sudo insmod ./pagedrop.ko path=extra data=260000000-280000000
+./userland/c/extra moveread
+mark "$?" "movein"
+
+say "rearm"
+sudo rmmod pagedrop 2>/dev/null || true
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+sudo insmod ./pagedrop.ko path=extra data=260000000-260001000
+./userland/c/extra rearm
+mark "$?" "rearm"
+
+say "fixed"
+sudo rmmod pagedrop 2>/dev/null || true
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+sudo insmod ./pagedrop.ko path=extra data=260000000-260001000
+./userland/c/extra fixed
+mark "$?" "fixed"
+
+say "pair"
+sudo rmmod pagedrop 2>/dev/null || true
+sudo rm -f /tmp/[0-9a-f]*_[0-9]*
+sudo insmod ./pagedrop.ko path=extra
+./userland/c/extra pair
+mark "$?" "pair"
+
+say "vfork"
+sudo rmmod pagedrop 2>/dev/null || true
+sudo insmod ./pagedrop.ko path=extra
+./userland/c/extra vfork
+mark "$?" "vfork"
+
+say "outside"
+sudo rmmod pagedrop 2>/dev/null || true
+sudo rm -f /tmp/pagedrop.trace
+sudo insmod ./pagedrop.ko path=extra data=260000000-260001000
+./userland/c/extra outside
+mark "$?" "outside"
+
+say "baddata"
+sudo rmmod pagedrop 2>/dev/null || true
+sudo insmod ./pagedrop.ko path=extra data=zz
+if [ $? -eq 0 ]; then
+	sudo rmmod pagedrop 2>/dev/null || true
+	mark 1 "baddata"
+else
+	mark 0 "baddata"
+fi
+
+say "wrarm"
+sudo rmmod pagedrop 2>/dev/null || true
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+sudo insmod ./pagedrop.ko path=extra data=260000000-260001000
+./userland/c/extra wrarm
+mark "$?" "wrarm"
+
+say "noneexec"
+sudo rmmod pagedrop 2>/dev/null || true
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+sudo insmod ./pagedrop.ko path=extra data=260000000-260001000
+./userland/c/extra noneexec
+mark "$?" "noneexec"
+
+say "disarm"
+sudo rmmod pagedrop 2>/dev/null || true
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+sudo insmod ./pagedrop.ko path=extra data=260000000-260001000
+./userland/c/extra disarm
+mark "$?" "disarm"
+
+say "stale"
+sudo rmmod pagedrop 2>/dev/null || true
+sudo rm -f /tmp/[0-9a-f]*_[0-9]*
+cp -f userland/c/extra /tmp/stalehelper
+sudo insmod ./pagedrop.ko path=extra
+timeout 3 ./userland/c/extra stale
+if [ $? -eq 139 ]; then
+	mark 0 "stale"
+else
+	mark 1 "stale"
+fi
 
 say "execfail"
 sudo rmmod pagedrop 2>/dev/null || true
@@ -134,6 +346,13 @@ sudo rm -f /tmp/[0-9a-f]*_[0-9]*
 sudo insmod ./pagedrop.ko path=extra
 ./userland/c/extra tag
 mark "$?" "tag"
+
+say "tagrace"
+sudo rmmod pagedrop 2>/dev/null || true
+sudo rm -f /tmp/[0-9a-f]*_[0-9]*
+sudo insmod ./pagedrop.ko path=extra
+./userland/c/extra tagrace
+mark "$?" "tagrace"
 
 say "upx"
 sudo rmmod pagedrop
