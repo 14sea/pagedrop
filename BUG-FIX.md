@@ -96,13 +96,13 @@ Fix: a data fault also consults the parent tgid's armed record and tracked page,
 
 What was not shown: `forkrace` passes 200 iterations both with and without the parent fallback, because the test waits for each child, so the parent always wins the lock. The fix rests on the code reading and the one observed failure, not on a reproducing test. If the failure returns, this fallback is the first thing to check.
 
-Modelled in a local, untracked TLA+ spec (maintainer copy at `models/fork-window`). With `useParent = FALSE` the fault handler consults only the child tgid and TLC reports the counterexample Fork, ChildFault, `sigdeliv_child = TRUE`, with no copy in between. With `useParent = TRUE` the property holds over the whole state space. That is the evidence the window is real and the fallback closes it.
+Modelled in a TLA+ spec kept locally and not committed; see `AGENTS.md`. With `useParent = FALSE` the fault handler consults only the child tgid and TLC reports the counterexample Fork, ChildFault, `sigdeliv_child = TRUE`, with no copy in between. With `useParent = TRUE` the property holds over the whole state space. That is the evidence the window is real and the fallback closes it.
 
 ## A child's records survived the child's own exit
 
 `pb_note_child` runs in the parent after the fork: `pb_tgid_add`, then `pb_copy_tracking`. The child can run and exit in between. Its `do_exit` drops records that do not exist yet, and the parent then registers a tgid that is already dead and copies pages into it. That tgid stays in the tracking list, so a later process that reuses that pid is treated as a target and inherits stale pages. This is the exit-leak class above, on the child side, and it was introduced by the `fork` fix.
 
-Modelled in a local, untracked TLA+ spec (maintainer copy at `models/fork-exit`). Property `EventualClear`, with weak fairness on the cleanup so stuttering cannot starve it. `useFix = FALSE` reproduces the shipped order and TLC reports `Temporal property EventualClear was violated` on Fork, TgidAdd, CopyBegin, CopyLand, ChildExit, with the tgid still registered and the records still copied. `useFix = TRUE` satisfies the property.
+Modelled in a TLA+ spec kept locally and not committed; see `AGENTS.md`. Property `EventualClear`, with weak fairness on the cleanup so stuttering cannot starve it. `useFix = FALSE` reproduces the shipped order and TLC reports `Temporal property EventualClear was violated` on Fork, TgidAdd, CopyBegin, CopyLand, ChildExit, with the tgid still registered and the records still copied. `useFix = TRUE` satisfies the property.
 
 Fix: do not register a tgid whose task has already exited, and drop the records again if the child died while the copy ran. `pb_child_alive` uses `find_vpid` and `get_pid_task`. Both suites pass, including `extra forkrace` and `extra pair`.
 
@@ -110,7 +110,7 @@ Fix: do not register a tgid whose task has already exited, and drop the records 
 
 `pb_handle_data` tested `data_seen`, then ran `dump_to_file` with no lock held, then added the record. The test and the insert were not one critical section, so two threads faulting the same armed page in the same handler epoch could both observe an empty list, both dump, and both write a trace line. That breaks the documented "dumped once per handler epoch" and gives `pb_rank` two index rows for one address.
 
-Modelled in a local, untracked TLA+ spec (maintainer copy at `models/double-dump`). TLC reports Seen1, Seen2, Dump1, Dump2, Dump1Done, Dump2Done, with `dumps = 2` and `traces = 2`, violating `Safe`.
+Modelled in a TLA+ spec kept locally and not committed; see `AGENTS.md`. TLC reports Seen1, Seen2, Dump1, Dump2, Dump1Done, Dump2Done, with `dumps = 2` and `traces = 2`, violating `Safe`.
 
 Reproduced on x86 `6.8.0-101-generic`: 8 threads released from a barrier onto one armed page produced 2 trace lines in 8 of 8 runs. Four threads produced 1. The count grows with the thread count, which is the signature of a lost update rather than a coincidence.
 
@@ -125,11 +125,13 @@ Two windows, both in the shipped code:
 - Arming: `pb_arm_range` called `pb_mprotect(PROT_NONE)` and only then added the record.
 - Disarming: `pb_disarm_range`, reached from any `mprotect` overlapping the range, deleted the record while the page was still `PROT_NONE`, and the real `mprotect` had not run yet.
 
-Modelled in a local, untracked TLA+ spec (maintainer copy at `models/arm-window`). The shipped order violates `Safe` with `ProtNoneUnrecorded` then `Read` and `dead = TRUE`. Recording first, `armFirst = TRUE`, holds.
+Modelled in a TLA+ spec kept locally and not committed; see `AGENTS.md`. The shipped order violates `Safe` with `ProtNoneUnrecorded` then `Read` and `dead = TRUE`. Recording first, `armFirst = TRUE`, holds.
 
 Reproduced on both arches with one thread re-arming in a loop and one thread reading: `SIGSEGV` in 4 of 5 runs on x86 `6.8.0-101-generic` and 4 of 5 on arm64 `6.6.62+rpt-rpi-v8`. As a suite case, `extra armrace` failed 5 of 15 before the fix and 0 of 15 after.
 
 Fix, in three parts:
+
+Fix, in three parts.
 
 - `pb_armed_claim` inserts the record under `marea_lock` before the page is made inaccessible, and `pb_armed_unclaim` removes it again if the `mprotect` fails. The record now outlives the protection it explains, in the arm direction.
 - `pb_disarm_range` restores each page to its saved protection first and deletes the records in a second pass, so the reverse also never leaves an unowned `PROT_NONE` page.
@@ -137,13 +139,31 @@ Fix, in three parts:
 
 A note on the count: `armrace` sometimes reports two trace lines and that is correct. The reloader advances the handler epoch on each `mprotect`, and the module promises one dump per handler epoch, so a second epoch legitimately dumps again. The defect is the crash, not the count.
 
+## Unloading the module stranded pages it had made inaccessible
+
+`data=` works by making a page `PROT_NONE`, and the only thing that can turn it back is this module's own fault handler, running inside the target process. `fh_exit` freed the records and restored nothing, and it could not: `module_exit` runs in the process doing the removal, and `mprotect` only affects the caller's address space. So after `rmmod`, a process holding an armed page took `SIGSEGV` on its next access to that address, a signal the module had caused itself.
+
+Reproduced on x86 `6.8.0-101-generic` with a `mkfifo` gate so the read happens only after the module is confirmed gone: the page is `---p` in `/proc/self/maps` while loaded, `rmmod` returns 0 with `refcnt 0` and `unloaded` in `dmesg`, the page is still `---p`, and the read faults. The target can rescue the page with its own `mprotect`, so this is an unhandled signal, not lost data and not an unrecoverable process. Not reproduced on arm64.
+
+Getting this wrong cost real time. The first several attempts concluded the opposite, that the page was fine after unload, and the reason was the harness: the child did `open()` on a gate file that did not exist yet, so the open failed, the wait was skipped, and the read happened while the module was still loaded, where the module correctly restored the page. Use a FIFO and block on `read()`; a plain file is not a gate. The test must also confirm the module is really gone, with `lsmod` and `dmesg`, before the read.
+
+Fix: while any armed record still describes a page that is `PROT_NONE`, the module holds a reference to itself, so `rmmod` returns `-EBUSY` and the fault handler stays available. Three deliberate choices:
+
+- State is a per-record `restored` flag, not a counter. A counter leaks in two opposite directions: too high and the module is never removable, too low and this stranding bug returns silently. The first version of the work item leaked permanently by leaving the queued flag set when it found a page still inaccessible, so no later release could ever be queued, and clearing the Pi needed a reboot. arm64 caught that on the first run.
+- The reference is dropped from a work item, never from a hook. If the last `module_put` ran inside the fault handler, `module_exit` would execute on the fault path, call `pb_remove_hooks`, and free the module text the handler is still running in.
+- The pin is taken before `PROT_NONE` is set, so there is never an instant where a page is inaccessible and the module is removable.
+
+Modelled locally, listed in `AGENTS.md`: `hookdrop` violates `NoStrand`, `leak` violates `NoLeak`, and the shipped configuration holds both. `extra pin` asserts `rmmod` is refused while a page is held and `extra pinoff` asserts it is permitted after a read. Both suites pass on x86 and arm64.
+
+One accepted cost: the release is asynchronous, so `rmmod` can be refused for a moment after the last armed page has gone. Scripts that remove the module immediately after a target exits may need to retry. That is the price of not dropping the reference from a hook.
+
 ## `mremap` moved an armed page into a window with no record
 
 `fh_sys_mremap` called `real_sys_mremap` first, so the kernel moved the page while it was still `PROT_NONE`, and only afterwards did `pb_note_mremap` move the armed record. In between, the page sat at its new address, inaccessible, with the record still filed under the old one. `pb_handle_data` found nothing, and the reader took a real `SIGSEGV`.
 
 The settle step had the mirror-image defect: for a destination outside the armed range it deleted the record and only then restored the protection, so it also left an inaccessible page with no record.
 
-Modelled in a local, untracked TLA+ spec (maintainer copy at `models/mremap-window`). The shipped order violates `Safe` with `MovePage` then `Read` and `dead = TRUE`; moving the record first, `moveRecordFirst = TRUE`, holds.
+Modelled in a TLA+ spec kept locally and not committed; see `AGENTS.md`. The shipped order violates `Safe` with `MovePage` then `Read` and `dead = TRUE`; moving the record first, `moveRecordFirst = TRUE`, holds.
 
 Reproduced with a reader spinning on a destination that is kept mapped by a shadow page, so a fault there can only be the module's. 8 of 8 failures on x86, and the control without the module survived 3 of 3.
 
@@ -157,7 +177,7 @@ Fix, in three parts:
 
 Still open, and it needs its own test: `mremap` without `MREMAP_FIXED` still has the window. The kernel picks the destination, so the record cannot be placed ahead of the move. Only the record can be consulted afterwards, which is too late for a reader that already faulted.
 
-## Correction: the `MREMAP_MAYMOVE` window is narrower than first written
+## Note on the `MREMAP_MAYMOVE` window above, not a separate bug
 
 The entry above calls the non-`FIXED` window open. That is right about the ordering and wrong about how often it can bite, and the difference is worth recording.
 
@@ -187,11 +207,25 @@ Two paths took the two locks in opposite orders.
 
 That is ABBA. One thread in the restore path and one thread in a plain `mmap` deadlocks, with the two locks held and both waits outstanding.
 
-Modelled in a local, untracked TLA+ spec (maintainer copy at `models/lock-order`). `heldLock = FALSE`, the shipped nesting, violates `Safe` with A holding `marea` waiting for `mmap` and B holding `mmap` waiting for `marea`. `heldLock = TRUE` holds.
+Modelled in a TLA+ spec kept locally and not committed; see `AGENTS.md`. `heldLock = FALSE`, the shipped nesting, violates `Safe` with A holding `marea` waiting for `mmap` and B holding `mmap` waiting for `marea`. `heldLock = TRUE` holds.
 
 The suite did not catch this. No case in 47 deadlocked, because the interleaving needs one thread restoring while another maps.
 
 Fix: no path holds `marea_lock` across `pb_mprotect` any more. Each of the three collects the record under the lock, restores with the lock released, then drops the record. The record still outlives the restore, so a reader that faults in that gap finds one and is handled, and a restore that lands on a page a reader already fixed is the same protection. Both suites pass.
+
+## A data page is only ever traced once, not once per handler epoch
+
+Not a crash, and not fixed. The contract in `README.md` and in the fix for "a data read was logged on every fault" says one dump per handler epoch. The code does one per data page, for the life of the process.
+
+A read fault restores the page but leaves the armed record in place, so `pb_arm_range` skips it for ever. The page stays readable, no later read faults, the hook is never entered, and no trace line is written at any later epoch. Only a `munmap`, a replacing `mmap` or an `mprotect` over the data page clears the record.
+
+Measured on x86 `6.8.0-101-generic`: arm, read once, re-`mprotect` the code page so it is dumped again and its epoch advances, read the same address. One trace line, not two. Clean trace and module unloaded, zero lines.
+
+Modelled in a TLA+ spec kept locally and not committed; see `AGENTS.md`. The shipped behaviour violates the property on Arm, Read, AdvanceEpoch, ReadStale; re-arming on epoch change holds.
+
+Left unfixed on purpose. Re-arming a stale record costs a fault per bytecode read rather than one per page, and every re-arm reintroduces the arming-window class of bug that caused the earlier `SIGSEGV` fixes. The decision and the options are documented in `AGENTS.md`.
+
+## Double validation of the fixes above, not a bug
 
 Each of these was run twice on the pre-fix module (`5257f3a`) and twice on the fixed module, on both x86 `6.8.0-101-generic` and arm64 `6.6.62+rpt-rpi-v8`.
 

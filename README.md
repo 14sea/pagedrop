@@ -137,7 +137,9 @@ insmod pagedrop.ko path=sigsegv.out
 ./sigsegv.out
 ```
 
-`path=` is a substring. `exact=1` matches it exactly. `data=start-end` (hex) arms that range. A read of it from a tracked executable page is dumped once per handler epoch, and `ip`, `data_va`, `epoch` are appended to `/tmp/pagedrop.trace`. `/tmp/pagedrop.index` records `tgid`, `comm`, `va`, `epoch`, and why for every dump.
+`path=` is a substring. `exact=1` matches it exactly. `data=start-end` (hex) arms that range. The first read of an armed page from a tracked executable page is dumped, and `ip`, `data_va`, `epoch` are appended to `/tmp/pagedrop.trace`. `/tmp/pagedrop.index` records `tgid`, `comm`, `va`, `epoch`, and why for every dump.
+
+The armed page is restored to its previous protection after that read and is not armed again, so each armed page is traced once for the life of the process rather than once per handler epoch. A later handler epoch that reads the same address is not seen. `munmap`, a replacing `mmap`, or an `mprotect` over the data page clears the record and the page is traced again.
 
 ```sh
 python3 tools/pb_rank.py --file ./regress.vmp --tgid 1234

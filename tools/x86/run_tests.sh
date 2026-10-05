@@ -221,6 +221,43 @@ mark "$?" "rankload"
 mark "$capture_rc" "rankload capture"
 
 
+say "pin"
+sudo rmmod pagedrop 2>/dev/null || true
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+sudo insmod ./pagedrop.ko path=extra data=260000000-260001000
+./userland/c/extra pin &
+pinpid=$!
+sleep 1
+if sudo rmmod pagedrop 2>/dev/null; then
+	mark 1 "pin"
+else
+	mark 0 "pin"
+fi
+kill "$pinpid" 2>/dev/null
+wait "$pinpid" 2>/dev/null
+# The unpin is asynchronous, so rmmod can fail for a moment after the last
+# armed page goes away. Poll rather than assume it has already happened.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+	sudo rmmod pagedrop 2>/dev/null && break
+	sleep 1
+done
+
+say "pinoff"
+sudo rmmod pagedrop 2>/dev/null || true
+sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace
+sudo insmod ./pagedrop.ko path=extra data=260000000-260001000
+./userland/c/extra read
+mark $? "pinoff read"
+pinoff=1
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+	if sudo rmmod pagedrop 2>/dev/null; then
+		pinoff=0
+		break
+	fi
+	sleep 1
+done
+mark "$pinoff" "pinoff rmmod"
+
 say "roarm"
 sudo rmmod pagedrop 2>/dev/null || true
 sudo rm -f /tmp/[0-9a-f]*_[0-9]* /tmp/pagedrop.index /tmp/pagedrop.trace

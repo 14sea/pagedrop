@@ -108,6 +108,7 @@ struct marea {
 	unsigned long prot;
 	pid_t tgid;
 	unsigned long epoch;
+	bool restored;
 };
 
 static unsigned long data_lo, data_hi;
@@ -115,6 +116,74 @@ static int data_on;
 static LIST_HEAD(data_seen);
 static LIST_HEAD(data_armed);
 static DEFINE_MUTEX(pb_log_lock);
+
+/*
+ * Module pinning for the unload hazard.
+ *
+ * data= works by making a page PROT_NONE, and only this module's own fault
+ * handler, running inside the target process, can turn it back. If the
+ * module is removed while such a page exists, the target keeps a page it
+ * can no longer read. fh_exit cannot fix that, because module_exit runs in
+ * the removing process and mprotect only affects the caller.
+ *
+ * While any data_armed record still describes a page that is PROT_NONE, a
+ * reference to this module is held, so rmmod returns -EBUSY instead of
+ * stranding the target. The state is a per-record flag rather than a
+ * counter, because a counter leaks in two opposite directions: too high
+ * and the module is never removable, too low and the stranding bug
+ * returns silently.
+ *
+ * The reference is dropped from a work item, never from a hook, so
+ * module_exit cannot free this code while a handler is still running it.
+ *
+ * pb_pin_held and pb_pin_scheduled are touched under marea_lock.
+ */
+static bool pb_pin_held;
+static bool pb_pin_scheduled;
+static void pb_pin_recheck(struct work_struct *work);
+static DECLARE_WORK(pb_pin_work, pb_pin_recheck);
+
+static bool pb_pin_needed_locked(void)
+{
+	struct marea *entry;
+
+	list_for_each_entry(entry, &data_armed, list) {
+		if (!entry->restored)
+			return true;
+	}
+	return false;
+}
+
+static void pb_pin_update_locked(void)
+{
+	if (pb_pin_needed_locked()) {
+		if (!pb_pin_held && try_module_get(THIS_MODULE))
+			pb_pin_held = true;
+		return;
+	}
+	if (pb_pin_held && !pb_pin_scheduled) {
+		pb_pin_scheduled = true;
+		schedule_work(&pb_pin_work);
+	}
+}
+
+static void pb_pin_recheck(struct work_struct *work)
+{
+	bool release = false;
+
+	mutex_lock(&marea_lock);
+	pb_pin_scheduled = false;
+	if (!pb_pin_needed_locked()) {
+		if (pb_pin_held) {
+			pb_pin_held = false;
+			release = true;
+		}
+	}
+	mutex_unlock(&marea_lock);
+	if (release)
+		module_put(THIS_MODULE);
+}
+
 
 static bool pb_name_matches(const char *name);
 
@@ -357,6 +426,7 @@ static struct marea *new_marea(pid_t tgid, unsigned long addr, unsigned long pro
 	new_m->prot = prot;
 	new_m->tgid = tgid;
 	new_m->epoch = 0;
+	new_m->restored = false;
 	INIT_LIST_HEAD(&new_m->list);
 	return new_m;
 }
@@ -677,6 +747,31 @@ static long pb_mprotect(unsigned long addr, unsigned long len, unsigned long pro
  * one and is handled. A restore that lands on a page a reader already fixed
  * is the same protection, so it is a no-op.
  */
+/*
+ * The restore has to run with no lock held, or it deadlocks against the
+ * mmap hook (models/lock-order). That leaves a window in which the page can
+ * be re-armed with a different protection, and a restore that trusts the
+ * value it read earlier then installs the old one, so a page the record
+ * calls read-only comes back writable. Re-read the record under the lock
+ * and restore only if it still says what we read. If the record is gone, the
+ * page was already handled and there is nothing to do.
+ */
+static bool pb_armed_unchanged(pid_t tgid, unsigned long page, unsigned long prot)
+{
+	struct marea *entry;
+	bool same = false;
+
+	mutex_lock(&marea_lock);
+	list_for_each_entry(entry, &data_armed, list) {
+		if (entry->tgid != tgid || entry->addr != page)
+			continue;
+		same = (entry->prot == prot);
+		break;
+	}
+	mutex_unlock(&marea_lock);
+	return same;
+}
+
 static void pb_disarm_range(pid_t tgid, unsigned long addr, unsigned long len)
 {
 	unsigned long start;
@@ -708,9 +803,9 @@ static void pb_disarm_range(pid_t tgid, unsigned long addr, unsigned long len)
 		if (!found)
 			continue;
 		prot = saved;
-		pb_mprotect(page, PAGE_SIZE, prot ? prot : PROT_READ);
-	}
-	mutex_lock(&marea_lock);
+		if (pb_armed_unchanged(tgid, page, prot))
+			pb_mprotect(page, PAGE_SIZE, prot ? prot : PROT_READ);
+	}	mutex_lock(&marea_lock);
 	list_for_each_entry_safe(entry, tmp, &data_seen, list) {
 		if (entry->tgid != tgid || entry->addr < start || entry->addr >= end)
 			continue;
@@ -722,9 +817,11 @@ static void pb_disarm_range(pid_t tgid, unsigned long addr, unsigned long len)
 	list_for_each_entry_safe(entry, tmp, &data_armed, list) {
 		if (entry->tgid != tgid || entry->addr < start || entry->addr >= end)
 			continue;
+		entry->restored = true;
 		list_del(&entry->list);
 		kfree(entry);
 	}
+	pb_pin_update_locked();
 	mutex_unlock(&marea_lock);
 }
 
@@ -824,9 +921,18 @@ static void pb_drop_tgid_list(struct list_head *head, pid_t tgid)
 
 static void pb_drop_data_state(pid_t tgid)
 {
+	struct marea *entry, *tmp;
+
 	mutex_lock(&marea_lock);
 	pb_drop_tgid_list(&data_seen, tgid);
-	pb_drop_tgid_list(&data_armed, tgid);
+	list_for_each_entry_safe(entry, tmp, &data_armed, list) {
+		if (entry->tgid != tgid)
+			continue;
+		entry->restored = true;
+		list_del(&entry->list);
+		kfree(entry);
+	}
+	pb_pin_update_locked();
 	mutex_unlock(&marea_lock);
 }
 
@@ -853,9 +959,11 @@ static void pb_drop_user_range(pid_t tgid, unsigned long addr, unsigned long len
 	list_for_each_entry_safe(entry, tmp, &data_armed, list) {
 		if (entry->tgid != tgid || entry->addr < start || entry->addr >= end)
 			continue;
+		entry->restored = true;
 		list_del(&entry->list);
 		kfree(entry);
 	}
+	pb_pin_update_locked();
 	list_for_each_entry_safe(entry, tmp, &data_seen, list) {
 		if (entry->tgid != tgid || entry->addr < start || entry->addr >= end)
 			continue;
@@ -901,6 +1009,7 @@ static void pb_armed_unclaim(pid_t tgid, unsigned long page)
 		kfree(seen);
 		break;
 	}
+	pb_pin_update_locked();
 	mutex_unlock(&marea_lock);
 }
 
@@ -1063,9 +1172,11 @@ static void pb_armed_after_move(unsigned long from, unsigned long to, int keep, 
 	/*
 	 * Restore before forgetting, and outside the lock for the same reason
 	 * as pb_disarm_range: pb_mprotect wants mmap_write_lock, which the
-	 * mmap hook already holds while taking marea_lock.
+	 * mmap hook already holds while taking marea_lock. Re-validate first,
+	 * so a page re-armed with a different protection in the gap is not
+	 * overwritten with the value we read before the move.
 	 */
-	if (found && keep && !in_range) {
+	if (found && keep && !in_range && pb_armed_unchanged(tgid, want, prot)) {
 		if (pb_mprotect(to, PAGE_SIZE, prot ? prot : PROT_READ))
 			pr_warn("restore %lx prot=%lx failed\n", to, prot);
 	}
@@ -1073,9 +1184,11 @@ static void pb_armed_after_move(unsigned long from, unsigned long to, int keep, 
 	list_for_each_entry_safe(entry, tmp, &data_armed, list) {
 		if (entry->tgid != tgid || entry->addr != want)
 			continue;
-		if (keep && in_range)
+		if (keep && in_range) {
+			/* still PROT_NONE at the new address, so the pin stays */
 			entry->addr = to;
-		else {
+		} else {
+			entry->restored = true;
 			list_del(&entry->list);
 			kfree(entry);
 		}
@@ -1144,17 +1257,20 @@ static void pb_release_armed(pid_t tgid, unsigned long page)
 		break;
 	}
 	mutex_unlock(&marea_lock);
-	/* Restore outside the lock, same reason as pb_disarm_range. */
-	if (found)
+	/* Restore outside the lock, same reason as pb_disarm_range, and only
+	 * if the record still says what we read. */
+	if (found && pb_armed_unchanged(tgid, page, prot))
 		pb_mprotect(page, PAGE_SIZE, prot ? prot : PROT_READ);
 	mutex_lock(&marea_lock);
 	list_for_each_entry_safe(entry, tmp, &data_armed, list) {
 		if (entry->tgid != tgid || entry->addr != page)
 			continue;
+		entry->restored = true;
 		list_del(&entry->list);
 		kfree(entry);
 		break;
 	}
+	pb_pin_update_locked();
 	list_for_each_entry_safe(entry, tmp, &data_seen, list) {
 		if (entry->tgid != tgid || entry->addr != page)
 			continue;
@@ -1435,6 +1551,7 @@ static int pb_handle_data(unsigned long address)
 	pid_t tgid = current->tgid;
 	pid_t parent;
 	struct pt_regs *regs;
+	struct marea *armed_entry;
 	bool tracked;
 	bool armed;
 
@@ -1472,6 +1589,13 @@ static int pb_handle_data(unsigned long address)
 		return 0;
 	}
 	kfree(regs);
+	mutex_lock(&marea_lock);
+	list_for_each_entry(armed_entry, &data_armed, list) {
+		if (armed_entry->tgid == tgid && armed_entry->addr == page)
+			armed_entry->restored = true;
+	}
+	pb_pin_update_locked();
+	mutex_unlock(&marea_lock);
 	if (tracked && pb_data_claim(tgid, page, handler_epoch)) {
 		if (dump_to_file(page, PAGE_SIZE, "read", NULL) == 0)
 			pb_trace_line(ip, page, handler_epoch);
@@ -1704,6 +1828,9 @@ static void pb_copy_list(struct list_head *head, pid_t from, pid_t to)
 		if (!fresh)
 			continue;
 		fresh->epoch = entry->epoch;
+		/* A child inherits the page exactly as accessible or as
+		 * inaccessible, so the pin state has to be copied with it. */
+		fresh->restored = entry->restored;
 		list_add(&fresh->list, &add);
 	}
 	list_splice(&add, head);
@@ -1972,6 +2099,9 @@ module_init(fh_init);
 
 static void fh_exit(void)
 {
+	cancel_work_sync(&pb_pin_work);
+	pb_pin_held = false;
+	pb_pin_scheduled = false;
 	pb_remove_hooks();
 	clear_tracked();
 	mutex_lock(&marea_lock);

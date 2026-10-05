@@ -883,6 +883,37 @@ static int do_execrace(void)
 	return 1;
 }
 
+/*
+ * The module must refuse to unload while a page is still inaccessible, and
+ * must not pin once the page has been read. Leaves the page armed on exit so
+ * the runner's rmmod is the thing under test.
+ */
+static int do_pin(void)
+{
+	unsigned char *data;
+	unsigned char *code;
+	volatile unsigned char x;
+	unsigned char *probe;
+
+	data = map_fixed(READ_DATA, PROT_READ | PROT_WRITE);
+	code = map_fixed(READ_CODE, PROT_READ | PROT_WRITE);
+	probe = map_fixed(0x266000000UL, PROT_READ | PROT_WRITE);
+	if (!data || !code || !probe) {
+		perror("pin mmap");
+		return 1;
+	}
+	memcpy(data, "BYTECODE", 8);
+	(void)probe;
+	(void)x;
+	if (mprotect(code, PAGE, PROT_READ | PROT_EXEC) != 0)
+		return 1;
+	/* Hold the page inaccessible. Reading it here would restore the
+	 * protection and release the pin, which is the other case. */
+	usleep(1500000);
+	printf("pin ok\n");
+	return 0;
+}
+
 static int do_maymove(void)
 {
 	unsigned char *code;
@@ -1492,6 +1523,8 @@ int main(int argc, char **argv)
 		return do_execrace();
 	if (!strcmp(argv[1], "maymove"))
 		return do_maymove();
+	if (!strcmp(argv[1], "pin"))
+		return do_pin();
 	if (!strcmp(argv[1], "roarm"))
 		return do_roarm();
 	if (!strcmp(argv[1], "moveread"))
@@ -1524,6 +1557,6 @@ int main(int argc, char **argv)
 	if (!strcmp(argv[1], "tagrace"))
 		return do_tagrace();
 #endif
-	fprintf(stderr, "usage: extra epoch|flip|fail|read|forkread|forkrace|dumprace|armrace|mremaprace|datarace|munmaprace|clonevm|execrace|maymove|roarm|moveread|rearm|fixed|pair|vfork|outside|wrarm|noneexec|disarm|stale|execve|execveat|tag|tagrace\n");
+	fprintf(stderr, "usage: extra epoch|flip|fail|read|forkread|forkrace|pin|dumprace|armrace|mremaprace|datarace|munmaprace|clonevm|execrace|maymove|roarm|moveread|rearm|fixed|pair|vfork|outside|wrarm|noneexec|disarm|stale|execve|execveat|tag|tagrace\n");
 	return 2;
 }
